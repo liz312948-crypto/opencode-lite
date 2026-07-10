@@ -4,11 +4,23 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
 
+from repopilot_lite.editing_service import EditingError, SafeEditingService
 from repopilot_lite.executor import Executor
-from repopilot_lite.models import StepLog, TaskCreate, TaskCreated, TaskRecord, TaskStatus, ToolInfo
+from repopilot_lite.models import (
+    PatchDecision,
+    PatchProposal,
+    PatchProposalCreate,
+    StepLog,
+    TaskCreate,
+    TaskCreated,
+    TaskRecord,
+    TaskStatus,
+    ToolInfo,
+)
 from repopilot_lite.planner import Planner
 from repopilot_lite.storage import Storage
 from repopilot_lite.tools import ToolRegistry, create_default_registry
+from repopilot_lite.workspace import WorkspaceManager
 
 app = FastAPI(
     title="OpenCode-Lite",
@@ -19,6 +31,7 @@ app = FastAPI(
 storage = Storage()
 planner = Planner()
 tool_registry = create_default_registry()
+workspace_manager = WorkspaceManager()
 
 
 def get_storage() -> Storage:
@@ -31,6 +44,10 @@ def get_planner() -> Planner:
 
 def get_tool_registry() -> ToolRegistry:
     return tool_registry
+
+
+def get_workspace_manager() -> WorkspaceManager:
+    return workspace_manager
 
 
 @app.post("/tasks", response_model=TaskCreated)
@@ -106,6 +123,65 @@ def get_task_logs(task_id: str, store: Storage = Depends(get_storage)) -> list[S
 @app.get("/tools", response_model=list[ToolInfo])
 def get_tools(registry: ToolRegistry = Depends(get_tool_registry)) -> list[ToolInfo]:
     return [ToolInfo.model_validate(tool) for tool in registry.list_tools()]
+
+
+@app.post("/tasks/{task_id}/patches", response_model=PatchProposal, status_code=201)
+def create_patch_proposal(
+    task_id: str,
+    payload: PatchProposalCreate,
+    store: Storage = Depends(get_storage),
+    manager: WorkspaceManager = Depends(get_workspace_manager),
+) -> PatchProposal:
+    task = _get_task_or_404(task_id, store)
+    service = SafeEditingService(store, manager)
+    try:
+        return service.submit_patch(task, payload)
+    except EditingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
+@app.get("/tasks/{task_id}/diff", response_model=PatchProposal)
+def get_task_diff(
+    task_id: str,
+    store: Storage = Depends(get_storage),
+    manager: WorkspaceManager = Depends(get_workspace_manager),
+) -> PatchProposal:
+    task = _get_task_or_404(task_id, store)
+    service = SafeEditingService(store, manager)
+    try:
+        return service.get_current_patch(task)
+    except EditingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
+@app.post("/tasks/{task_id}/approve", response_model=PatchProposal)
+def approve_task_patch(
+    task_id: str,
+    payload: PatchDecision,
+    store: Storage = Depends(get_storage),
+    manager: WorkspaceManager = Depends(get_workspace_manager),
+) -> PatchProposal:
+    task = _get_task_or_404(task_id, store)
+    service = SafeEditingService(store, manager)
+    try:
+        return service.approve_patch(task, payload)
+    except EditingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
+@app.post("/tasks/{task_id}/reject", response_model=PatchProposal)
+def reject_task_patch(
+    task_id: str,
+    payload: PatchDecision,
+    store: Storage = Depends(get_storage),
+    manager: WorkspaceManager = Depends(get_workspace_manager),
+) -> PatchProposal:
+    task = _get_task_or_404(task_id, store)
+    service = SafeEditingService(store, manager)
+    try:
+        return service.reject_patch(task, payload)
+    except EditingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
 
 
 def _get_task_or_404(task_id: str, store: Storage) -> TaskRecord:
