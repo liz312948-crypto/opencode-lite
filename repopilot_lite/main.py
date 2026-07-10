@@ -184,6 +184,20 @@ def reject_task_patch(
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
 
 
+@app.post("/tasks/{task_id}/execute", response_model=TaskRecord)
+def execute_task_patch(
+    task_id: str,
+    store: Storage = Depends(get_storage),
+    manager: WorkspaceManager = Depends(get_workspace_manager),
+) -> TaskRecord:
+    task = _get_task_or_404(task_id, store)
+    service = SafeEditingService(store, manager)
+    try:
+        return service.execute_patch(task)
+    except EditingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
 def _get_task_or_404(task_id: str, store: Storage) -> TaskRecord:
     task = store.get_task(task_id)
     if task is None:

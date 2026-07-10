@@ -60,6 +60,10 @@ def test_patch_review_and_approval_bind_exact_patch(
     assert diff_response.status_code == 200
     assert diff_response.json()["id"] == proposal["id"]
 
+    unapproved_execution = client.post(f"/tasks/{task_id}/execute")
+    assert unapproved_execution.status_code == 409
+    assert unapproved_execution.json()["detail"]["error_code"] == "PATCH_NOT_APPROVED"
+
     wrong_approval = client.post(
         f"/tasks/{task_id}/approve",
         json={"patch_id": "wrong-patch"},
