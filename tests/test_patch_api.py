@@ -9,7 +9,6 @@ from repopilot_lite.main import app, get_storage, get_workspace_manager
 from repopilot_lite.storage import Storage
 from repopilot_lite.workspace import WorkspaceManager
 
-
 VALID_PATCH = """--- a/app.py
 +++ b/app.py
 @@ -1,2 +1,2 @@

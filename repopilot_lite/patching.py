@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-
-HUNK_HEADER = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*?)(?:\r?\n)?$"
-)
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*?)(?:\r?\n)?$")
+MAX_PATCH_CHARS = 1_000_000
+MAX_PATCH_FILES = 100
+MAX_HUNKS_PER_FILE = 1_000
 
 
 class PatchValidationError(ValueError):
@@ -44,6 +46,8 @@ class PatchApplier:
     def parse(self, unified_diff: str) -> list[FilePatch]:
         if not unified_diff.strip():
             raise PatchValidationError("Patch content is empty.")
+        if len(unified_diff) > MAX_PATCH_CHARS:
+            raise PatchValidationError(f"Patch exceeds the {MAX_PATCH_CHARS}-character limit.")
         if "GIT binary patch" in unified_diff or "Binary files " in unified_diff:
             raise PatchValidationError("Binary patches are not supported.")
 
@@ -68,7 +72,9 @@ class PatchApplier:
             index += 1
 
             if old_path == "/dev/null" or new_path == "/dev/null":
-                raise PatchValidationError("File creation and deletion are not supported in this alpha.")
+                raise PatchValidationError(
+                    "File creation and deletion are not supported in this alpha."
+                )
             normalized_old = self._normalize_patch_path(old_path)
             normalized_new = self._normalize_patch_path(new_path)
             if normalized_old != normalized_new:
@@ -78,6 +84,10 @@ class PatchApplier:
 
             hunks: list[PatchHunk] = []
             while index < len(lines) and lines[index].startswith("@@ "):
+                if len(hunks) >= MAX_HUNKS_PER_FILE:
+                    raise PatchValidationError(
+                        f"Patch for {normalized_new} exceeds the hunk limit."
+                    )
                 hunk, index = self._parse_hunk(lines, index)
                 hunks.append(hunk)
 
@@ -86,6 +96,8 @@ class PatchApplier:
 
             seen_paths.add(normalized_new)
             file_patches.append(FilePatch(path=normalized_new, hunks=tuple(hunks)))
+            if len(file_patches) > MAX_PATCH_FILES:
+                raise PatchValidationError(f"Patch exceeds the {MAX_PATCH_FILES}-file limit.")
 
         if not file_patches:
             raise PatchValidationError("Patch does not contain a file modification.")
@@ -105,11 +117,16 @@ class PatchApplier:
         temporary_files: list[Path] = []
         try:
             for target, content in prepared.items():
-                temporary = target.with_name(f".{target.name}.opencode-lite.tmp")
-                with temporary.open("w", encoding="utf-8", newline="") as handle:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.",
+                    suffix=".opencode-lite.tmp",
+                    dir=target.parent,
+                )
+                temporary = Path(temporary_name)
+                temporary_files.append(temporary)
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
                     handle.write(content)
                 shutil.copymode(target, temporary)
-                temporary_files.append(temporary)
 
             for target, temporary in zip(prepared, temporary_files, strict=True):
                 temporary.replace(target)
@@ -226,13 +243,13 @@ class PatchApplier:
             for patch_line in hunk.lines:
                 prefix = patch_line[0]
                 content = patch_line[1:]
-                if prefix in {" ", "-"}:
-                    if cursor >= len(source_lines) or not self._same_line(
-                        source_lines[cursor], content
-                    ):
-                        raise PatchValidationError(
-                            f"Hunk context does not match {file_patch.path} at line {cursor + 1}."
-                        )
+                if prefix in {" ", "-"} and (
+                    cursor >= len(source_lines)
+                    or not self._same_line(source_lines[cursor], content)
+                ):
+                    raise PatchValidationError(
+                        f"Hunk context does not match {file_patch.path} at line {cursor + 1}."
+                    )
                 if prefix == " ":
                     output.append(source_lines[cursor])
                     cursor += 1

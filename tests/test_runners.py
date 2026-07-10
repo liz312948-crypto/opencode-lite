@@ -86,6 +86,22 @@ def test_test_runner_rejects_arbitrary_python(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("unsafe_path", ["../../outside", "C:\\outside", "/outside"])
+def test_test_runner_rejects_path_arguments_outside_workspace(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(CommandPolicyError, match="outside"):
+        TestRunner().select_command(
+            workspace,
+            [sys.executable, "-m", "pytest", f"--basetemp={unsafe_path}"],
+            5,
+        )
+
+
 def test_test_runner_detects_pytest_project(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

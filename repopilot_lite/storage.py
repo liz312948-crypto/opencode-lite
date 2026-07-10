@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -40,7 +40,7 @@ class Storage:
         return TaskRecord.model_validate(raw_task)
 
     def update_task(self, task: TaskRecord) -> TaskRecord:
-        task.updated_at = datetime.now(timezone.utc)
+        task.updated_at = datetime.now(UTC)
         with self._lock:
             tasks = self._read_json(self.tasks_file)
             tasks[task.task_id] = task.model_dump(mode="json")
@@ -116,7 +116,7 @@ class Storage:
         return PatchProposal.model_validate(raw_patch)
 
     def update_patch(self, patch: PatchProposal) -> PatchProposal:
-        patch.updated_at = datetime.now(timezone.utc)
+        patch.updated_at = datetime.now(UTC)
         with self._lock:
             patches = self._read_json(self.patches_file)
             if patch.id not in patches:

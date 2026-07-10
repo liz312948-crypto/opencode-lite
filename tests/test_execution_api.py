@@ -9,7 +9,6 @@ from repopilot_lite.main import app, get_storage, get_workspace_manager
 from repopilot_lite.storage import Storage
 from repopilot_lite.workspace import WorkspaceManager
 
-
 FIXTURE_REPO = Path(__file__).parent / "fixtures" / "sample_repo"
 PASSING_PATCH = """--- a/calculator.py
 +++ b/calculator.py
@@ -46,8 +45,8 @@ def test_safe_editing_success_keeps_source_unchanged(tmp_path: Path) -> None:
     assert "return left + right" in task["execution_report"]["diff"]
 
     workspace = Path(task["workspace_path"])
-    assert (workspace / "calculator.py").read_text(encoding="utf-8").endswith(
-        "return left + right\n"
+    assert (
+        (workspace / "calculator.py").read_text(encoding="utf-8").endswith("return left + right\n")
     )
     assert (FIXTURE_REPO / "calculator.py").read_bytes() == original_source
     assert client.get(f"/tasks/{task_id}/diff").json()["validation_status"] == "APPLIED"

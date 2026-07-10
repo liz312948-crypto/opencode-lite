@@ -6,7 +6,6 @@ import pytest
 
 from repopilot_lite.patching import PatchApplier, PatchValidationError
 
-
 VALID_PATCH = """--- a/app.py
 +++ b/app.py
 @@ -1,2 +1,2 @@
@@ -24,6 +23,8 @@ def test_patch_dry_run_and_apply_only_change_workspace(tmp_path: Path) -> None:
     original = "def add(a, b):\r\n    return a - b\r\n"
     _write_exact(source / "app.py", original)
     _write_exact(workspace / "app.py", original)
+    sentinel = workspace / ".app.py.opencode-lite.tmp"
+    sentinel.write_text("keep me", encoding="utf-8")
     applier = PatchApplier()
 
     assert applier.validate(workspace, VALID_PATCH) == ["app.py"]
@@ -33,9 +34,8 @@ def test_patch_dry_run_and_apply_only_change_workspace(tmp_path: Path) -> None:
 
     assert modified_files == ["app.py"]
     assert _read_exact(source / "app.py") == original
-    assert _read_exact(workspace / "app.py") == (
-        "def add(a, b):\r\n    return a + b\r\n"
-    )
+    assert _read_exact(workspace / "app.py") == ("def add(a, b):\r\n    return a + b\r\n")
+    assert sentinel.read_text(encoding="utf-8") == "keep me"
     assert "return a + b" in applier.actual_diff(source, workspace, modified_files)
 
 

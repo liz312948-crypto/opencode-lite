@@ -7,7 +7,6 @@ from typing import Any
 
 from repopilot_lite.llm_client import OptionalLLMSummarizer
 
-
 IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build"}
 TEXT_SUFFIXES = {
     ".cfg",
@@ -55,15 +54,23 @@ class ToolRegistry:
         return tool.handler(**kwargs)
 
     def list_tools(self) -> list[dict[str, str]]:
-        return [{"name": tool.name, "description": tool.description} for tool in self._tools.values()]
+        return [
+            {"name": tool.name, "description": tool.description} for tool in self._tools.values()
+        ]
 
 
 def create_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register("list_files", "List readable files in a repository.", list_files)
-    registry.register("read_file", "Read a text file from a repository by relative path.", read_file)
+    registry.register(
+        "read_file", "Read a text file from a repository by relative path.", read_file
+    )
     registry.register("search_text", "Search text keywords inside repository files.", search_text)
-    registry.register("summarize_repo", "Generate repository understanding and modification planning output.", summarize_repo)
+    registry.register(
+        "summarize_repo",
+        "Generate repository understanding and modification planning output.",
+        summarize_repo,
+    )
     return registry
 
 
@@ -155,9 +162,12 @@ def summarize_repo(
     if llm_result is not None:
         return _normalize_summary_result(llm_result, key_files)
 
-    readme_summary = _compact_text(readme, max_chars=600) if readme else "No README content was found."
+    readme_summary = (
+        _compact_text(readme, max_chars=600) if readme else "No README content was found."
+    )
     summary = (
-        f"Repository '{repo.name}' contains {len(files)} indexed files and is ready for modification planning. "
+        f"Repository '{repo.name}' contains {len(files)} indexed files "
+        "and is ready for modification planning. "
         f"The question is: {question}. "
         f"README signal: {readme_summary}"
     )
@@ -169,13 +179,16 @@ def summarize_repo(
         "Add or update tests before changing behavior in shared modules.",
     ]
     suggestions = [
-        "Start with README and project configuration files to confirm setup and runtime assumptions.",
+        "Start with README and project configuration files to confirm setup "
+        "and runtime assumptions.",
         "Inspect the listed key files before changing behavior.",
         "Add focused tests around the requested behavior before making code changes.",
     ]
 
     if search_matches:
-        suggestions.insert(1, "Review keyword matches because they are the most direct links to the question.")
+        suggestions.insert(
+            1, "Review keyword matches because they are the most direct links to the question."
+        )
 
     return {
         "repo_summary": summary,
@@ -190,7 +203,9 @@ def summarize_repo(
 def _resolve_repo(repo_path: str) -> Path:
     repo = Path(repo_path).expanduser().resolve()
     if not repo.exists() or not repo.is_dir():
-        raise FileNotFoundError(f"Repository path does not exist or is not a directory: {repo_path}")
+        raise FileNotFoundError(
+            f"Repository path does not exist or is not a directory: {repo_path}"
+        )
     return repo
 
 
@@ -227,9 +242,11 @@ def _select_key_files(files: list[str], search_matches: list[dict[str, Any]]) ->
     priority_names = ("README", "pyproject.toml", "requirements.txt", "main.py", "app.py")
     for file_path in files:
         name = Path(file_path).name
-        if any(name.startswith(priority) or name == priority for priority in priority_names):
-            if file_path not in weighted:
-                weighted.append(file_path)
+        if (
+            any(name.startswith(priority) or name == priority for priority in priority_names)
+            and file_path not in weighted
+        ):
+            weighted.append(file_path)
 
     for file_path in files[:10]:
         if file_path not in weighted:
@@ -249,13 +266,18 @@ def _build_modification_plan(question: str, key_files: list[str]) -> list[dict[s
             "title": "Confirm existing behavior",
             "target_files": primary_files,
             "action": "Read the key files and map the current request flow before editing.",
-            "reason": f"The question '{question}' should be grounded in the current implementation first.",
+            "reason": (
+                f"The question '{question}' should be grounded in the current implementation first."
+            ),
         },
         {
             "title": "Design the smallest code change",
             "target_files": primary_files,
             "action": "Identify the minimal functions or modules that need updates.",
-            "reason": "Keeping the change narrow lowers regression risk and preserves the existing architecture.",
+            "reason": (
+                "Keeping the change narrow lowers regression risk and preserves "
+                "the existing architecture."
+            ),
         },
         {
             "title": "Add verification coverage",
@@ -266,11 +288,15 @@ def _build_modification_plan(question: str, key_files: list[str]) -> list[dict[s
     ]
 
 
-def _normalize_summary_result(result: dict[str, Any], fallback_key_files: list[str]) -> dict[str, Any]:
+def _normalize_summary_result(
+    result: dict[str, Any], fallback_key_files: list[str]
+) -> dict[str, Any]:
     return {
         "repo_summary": str(result.get("repo_summary") or "LLM summary was unavailable."),
         "key_files": _string_list(result.get("key_files")) or fallback_key_files,
-        "modification_plan": _modification_plan_list(result.get("modification_plan"), fallback_key_files),
+        "modification_plan": _modification_plan_list(
+            result.get("modification_plan"), fallback_key_files
+        ),
         "risk_notes": _string_list(result.get("risk_notes"))
         or ["LLM output should be reviewed before applying any code changes."],
         "llm_used": bool(result.get("llm_used")),
@@ -292,7 +318,9 @@ def _modification_plan_list(value: Any, fallback_key_files: list[str]) -> list[d
                 "title": str(item.get("title") or "Review planned change"),
                 "target_files": _string_list(item.get("target_files")) or fallback_key_files[:3],
                 "action": str(item.get("action") or "Inspect the target files."),
-                "reason": str(item.get("reason") or "The step supports safer modification planning."),
+                "reason": str(
+                    item.get("reason") or "The step supports safer modification planning."
+                ),
             }
         )
 

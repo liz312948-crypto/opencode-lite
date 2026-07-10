@@ -17,9 +17,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.PATCH_PROPOSED: frozenset(
         {TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED, TaskStatus.CANCELLED}
     ),
-    TaskStatus.AWAITING_APPROVAL: frozenset(
-        {TaskStatus.APPLYING_PATCH, TaskStatus.CANCELLED}
-    ),
+    TaskStatus.AWAITING_APPROVAL: frozenset({TaskStatus.APPLYING_PATCH, TaskStatus.CANCELLED}),
     TaskStatus.APPLYING_PATCH: frozenset({TaskStatus.TESTING, TaskStatus.ROLLING_BACK}),
     TaskStatus.TESTING: frozenset({TaskStatus.SUCCEEDED, TaskStatus.ROLLING_BACK}),
     TaskStatus.ROLLING_BACK: frozenset({TaskStatus.FAILED}),

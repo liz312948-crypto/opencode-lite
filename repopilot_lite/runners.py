@@ -5,12 +5,11 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 
 from repopilot_lite.models import CommandResult, CommandSpec
-
 
 INHERITED_ENV_KEYS = frozenset(
     {
@@ -51,7 +50,7 @@ class CommandRunner:
     def run(self, spec: CommandSpec) -> CommandResult:
         cwd = self._validate_cwd(spec.cwd)
         environment = self._build_environment(spec.env_overrides)
-        started_at = datetime.now(timezone.utc)
+        started_at = datetime.now(UTC)
         started = perf_counter()
         exit_code: int | None
         stdout = ""
@@ -86,7 +85,7 @@ class CommandRunner:
             stderr = f"Command could not start: {exc}"
 
         duration_ms = round((perf_counter() - started) * 1000)
-        finished_at = datetime.now(timezone.utc)
+        finished_at = datetime.now(UTC)
         stdout, stdout_truncated = self._truncate(stdout)
         stderr, stderr_truncated = self._truncate(stderr)
         return CommandResult(
@@ -203,15 +202,32 @@ class TestRunner:
 
         executable = Path(argv[0]).name.lower()
         if executable in {"pytest", "pytest.exe"}:
+            TestRunner._validate_argument_paths(argv[1:])
             return
         if executable in {"python", "python.exe", "python3", "python3.exe"}:
             if len(argv) >= 3 and argv[1:3] == ["-m", "pytest"]:
+                TestRunner._validate_argument_paths(argv[3:])
                 return
             raise CommandPolicyError("Python test commands must use 'python -m pytest'.")
         if executable in {"npm", "npm.cmd", "npm.exe"}:
             if len(argv) >= 2 and argv[1] == "test":
+                TestRunner._validate_argument_paths(argv[2:])
                 return
             raise CommandPolicyError("npm test commands must use 'npm test'.")
         raise CommandPolicyError(
             "Unsupported test command. Allowed commands are pytest, python -m pytest, and npm test."
         )
+
+    @staticmethod
+    def _validate_argument_paths(arguments: list[str]) -> None:
+        for argument in arguments:
+            if "\x00" in argument:
+                raise CommandPolicyError("Test command arguments cannot contain null bytes.")
+            candidate = argument.split("=", maxsplit=1)[-1] if "=" in argument else argument
+            normalized = candidate.replace("\\", "/")
+            parts = PurePosixPath(normalized).parts
+            has_windows_drive = bool(re.match(r"^[A-Za-z]:", candidate))
+            if PurePosixPath(normalized).is_absolute() or has_windows_drive or ".." in parts:
+                raise CommandPolicyError(
+                    "Test command arguments cannot reference paths outside the workspace."
+                )

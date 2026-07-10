@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -164,7 +163,7 @@ class SafeEditingService:
 
         patch.validation_status = PatchValidationStatus.APPROVED
         patch.approved_hash = patch.content_hash
-        patch.approved_at = datetime.now(timezone.utc)
+        patch.approved_at = datetime.now(UTC)
         self.storage.update_patch(patch)
         task.approved_patch_id = patch.id
         self.storage.update_task(task)

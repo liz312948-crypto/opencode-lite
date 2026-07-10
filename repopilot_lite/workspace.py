@@ -5,7 +5,6 @@ import shutil
 import tempfile
 from pathlib import Path
 
-
 IGNORED_WORKSPACE_DIRS = frozenset(
     {
         ".git",
@@ -45,7 +44,9 @@ class WorkspaceManager:
         destination = self.workspace_path(task_id)
 
         if self._is_within(self.base_dir, source) or self._is_within(source, self.base_dir):
-            raise WorkspaceError("Workspace root and source repository must not contain each other.")
+            raise WorkspaceError(
+                "Workspace root and source repository must not contain each other."
+            )
 
         if destination.exists():
             if not replace:

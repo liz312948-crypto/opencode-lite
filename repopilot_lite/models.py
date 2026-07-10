@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class TaskStatus(StrEnum):
@@ -44,7 +44,7 @@ class RiskLevel(StrEnum):
 class TaskCreate(BaseModel):
     repo_path: str = Field(..., min_length=1)
     question: str = Field(..., min_length=1)
-    test_command: list[str] | None = None
+    test_command: list[str] | None = Field(default=None, max_length=32)
     test_timeout_seconds: int = Field(default=60, ge=1, le=300)
 
     @field_validator("test_command")
@@ -105,10 +105,10 @@ class CommandResult(BaseModel):
 
 
 class PatchProposalCreate(BaseModel):
-    unified_diff: str = Field(..., min_length=1)
+    unified_diff: str = Field(..., min_length=1, max_length=1_000_000)
     reason: str = Field(default="User-submitted patch proposal.", min_length=1)
     risk_level: RiskLevel = RiskLevel.MEDIUM
-    target_files: list[str] = Field(default_factory=list)
+    target_files: list[str] = Field(default_factory=list, max_length=100)
     generated_by: str = Field(default="user", min_length=1, max_length=50)
 
 

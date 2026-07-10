@@ -24,7 +24,9 @@ from repopilot_lite.workspace import WorkspaceManager
 
 app = FastAPI(
     title="OpenCode-Lite",
-    description="A safe, inspectable, and test-driven coding agent harness for repository-level tasks.",
+    description=(
+        "A safe, inspectable, and test-driven coding agent harness for repository-level tasks."
+    ),
     version="0.3.0-alpha",
 )
 
@@ -86,7 +88,9 @@ def run_task(
         return task
 
     if task.status not in {TaskStatus.PENDING, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-        raise HTTPException(status_code=409, detail=f"Task cannot be run from status {task.status}.")
+        raise HTTPException(
+            status_code=409, detail=f"Task cannot be run from status {task.status}."
+        )
 
     store.transition_status(task, TaskStatus.PLANNING)
     try:
