@@ -1,14 +1,18 @@
-# RepoPilot Lite
+# OpenCode-Lite
 
-RepoPilot-Lite is a lightweight Coding Agent backend prototype for repository understanding and modification planning.
+OpenCode-Lite is a safe, inspectable, and test-driven coding agent harness for repository-level tasks.
 
-A developer submits a local repository path and a question, then receives `repo_summary`, `key_files`, `modification_plan`, `risk_notes`, `suggestions`, and execution logs.
+A developer submits a local repository path and a question, reviews a proposed patch, explicitly approves it, and runs bounded tests inside an isolated workspace.
+
+> OpenCode-Lite is an independent educational and engineering project. It is not affiliated with or endorsed by the OpenCode project.
+>
+> OpenCode-Lite 是一个独立的学习与工程项目，不隶属于 OpenCode 项目，也未获得其认可或背书。
 
 [RepoPilot-Lite v0.2 Product Walkthrough](https://github.com/liz312948-crypto/RepoPilot-Lite/releases/download/v0.2.0/RepoPilot-Lite-v0.2-Product-Walkthrough.mp4)
 
 ## Why This Project
 
-RepoPilot-Lite simulates the core backend workflow behind AI coding tools: task creation, planning, tool execution, context collection, modification planning, logs, and fallback behavior.
+OpenCode-Lite simulates the core backend workflow behind AI coding tools: task creation, planning, tool execution, context collection, modification planning, logs, and fallback behavior.
 
 It is not a full IDE, does not automatically modify code, and does not replace Claude Code, TRAE, or other AI programming tools. The project focuses on a small backend prototype that makes the coding-agent execution path observable, bounded, and easy to explain.
 
@@ -32,7 +36,7 @@ Example input:
 
 ```json
 {
-  "repo_path": "D:\RepoPilot-Lite",
+  "repo_path": "D:\\OpenCode-Lite",
   "question": "How should we add a new repository analysis feature?"
 }
 ```
@@ -124,7 +128,7 @@ http://127.0.0.1:8000/docs
 ```bash
 curl -X POST http://127.0.0.1:8000/tasks ^
   -H "Content-Type: application/json" ^
-  -d "{"repo_path":"D:\\RepoPilot-Lite","question":"How should we add a new repository analysis feature?"}"
+  -d "{"repo_path":"D:\\OpenCode-Lite","question":"How should we add a new repository analysis feature?"}"
 ```
 
 ### Run Task
@@ -163,7 +167,7 @@ curl http://127.0.0.1:8000/tools
 
 ## Agent Loop
 
-RepoPilot-Lite keeps the loop intentionally small and bounded:
+OpenCode-Lite keeps the loop intentionally small and bounded:
 
 ```text
 initial keyword search
@@ -184,7 +188,7 @@ The output is planning-focused. Each modification step contains:
 - `action`: what a coding agent or developer should do next.
 - `reason`: why the step matters.
 
-RepoPilot-Lite helps identify what to inspect, where changes may belong, and what risks should be checked first.
+OpenCode-Lite helps identify what to inspect, where changes may belong, and what risks should be checked first.
 
 ## Optional LLM Configuration
 
