@@ -22,7 +22,7 @@ class Executor:
             "search_matches": [],
             "summary_result": None,
         }
-        self.storage.update_status(task, TaskStatus.RUNNING)
+        self.storage.transition_status(task, TaskStatus.RUNNING)
 
         try:
             for step in task.plan:
@@ -41,10 +41,15 @@ class Executor:
                     search_matches=context["search_matches"],
                 )
             task.result = TaskResult.model_validate(result)
-            self.storage.update_status(task, TaskStatus.SUCCESS)
+            self.storage.transition_status(task, TaskStatus.SUCCESS)
         except Exception as exc:
             self._log(task, "executor", "FAILED", str(exc))
-            self.storage.update_status(task, TaskStatus.FAILED, error=str(exc))
+            self.storage.transition_status(
+                task,
+                TaskStatus.FAILED,
+                error_code="EXECUTOR_FAILED",
+                error_message=str(exc),
+            )
 
         return self.storage.get_task(task.task_id) or task
 
