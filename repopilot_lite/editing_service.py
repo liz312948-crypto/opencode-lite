@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -19,11 +20,16 @@ from repopilot_lite.models import (
     TaskRecord,
     TaskStatus,
 )
-from repopilot_lite.patching import PatchApplier, PatchValidationError, patch_content_hash
+from repopilot_lite.patching import (
+    PatchApplier,
+    PatchApplyError,
+    PatchValidationError,
+    patch_content_hash,
+)
 from repopilot_lite.runners import CommandPolicyError, CommandRunner, TestRunner
 from repopilot_lite.storage import Storage
 from repopilot_lite.task_locks import TaskLockManager, default_task_lock_manager
-from repopilot_lite.workspace import WorkspaceError, WorkspaceManager
+from repopilot_lite.workspace import WorkspaceError, WorkspaceManager, WorkspaceManifest
 
 
 class EditingError(RuntimeError):
@@ -50,6 +56,19 @@ class _ExecutionFailure(RuntimeError):
         self.error_code = error_code
         self.message = message
         self.stage = stage
+
+
+@dataclass
+class _ExecutionIntegrity:
+    baseline_manifest: WorkspaceManifest
+    source_manifest_before: WorkspaceManifest
+    expected_manifest: WorkspaceManifest | None = None
+    final_manifest: WorkspaceManifest | None = None
+    source_manifest_after: WorkspaceManifest | None = None
+    attempted_files: list[str] = field(default_factory=list)
+    replaced_files: list[str] = field(default_factory=list)
+    restored_files: list[str] = field(default_factory=list)
+    restore_errors: list[str] = field(default_factory=list)
 
 
 class SafeEditingService:
@@ -312,6 +331,21 @@ class SafeEditingService:
                 "The approved test command has changed and must be approved again.",
             )
 
+        baseline_manifest = self.workspace_manager.manifest(workspace)
+        source_manifest_before = self.workspace_manager.manifest(source)
+        if baseline_manifest != source_manifest_before:
+            raise EditingError(
+                409,
+                "WORKSPACE_BASELINE_MISMATCH",
+                "The task workspace no longer matches its source baseline.",
+                patch_id=patch.id,
+            )
+        integrity = _ExecutionIntegrity(
+            baseline_manifest=baseline_manifest,
+            source_manifest_before=source_manifest_before,
+            attempted_files=list(patch.target_files),
+        )
+
         self.storage.transition_status(task, TaskStatus.APPLYING_PATCH)
         modified_files: list[str] = []
         actual_diff = ""
@@ -319,6 +353,8 @@ class SafeEditingService:
 
         try:
             modified_files = self.patch_applier.apply(workspace, patch.unified_diff)
+            integrity.replaced_files = list(modified_files)
+            integrity.expected_manifest = self.workspace_manager.manifest(workspace)
             actual_diff = self.patch_applier.actual_diff(source, workspace, modified_files)
             self.storage.add_log(
                 StepLog(
@@ -356,6 +392,39 @@ class SafeEditingService:
                     f"Test command failed with exit code {command_result.exit_code}.",
                     "testing",
                 )
+            integrity.final_manifest = self.workspace_manager.manifest(workspace)
+            integrity.source_manifest_after = self.workspace_manager.manifest(source)
+            if integrity.source_manifest_after != integrity.source_manifest_before:
+                raise _ExecutionFailure(
+                    "SOURCE_REPOSITORY_CHANGED",
+                    "The source repository changed during test execution.",
+                    "integrity_check",
+                )
+            if integrity.final_manifest != integrity.expected_manifest:
+                raise _ExecutionFailure(
+                    "WORKSPACE_CHANGED_DURING_TESTS",
+                    "Tests changed files outside the approved workspace result.",
+                    "integrity_check",
+                )
+            actual_diff = self.patch_applier.actual_diff(source, workspace, modified_files)
+        except PatchApplyError as exc:
+            integrity.attempted_files = list(exc.attempted_files)
+            integrity.replaced_files = list(exc.replaced_files)
+            integrity.restored_files = list(exc.restored_files)
+            integrity.restore_errors = list(exc.restore_errors)
+            modified_files = list(exc.replaced_files)
+            return self._rollback_failure(
+                task,
+                patch,
+                command_spec,
+                test_results,
+                modified_files,
+                actual_diff,
+                "PATCH_APPLY_FAILED",
+                str(exc),
+                "patch_apply",
+                integrity,
+            )
         except _ExecutionFailure as exc:
             return self._rollback_failure(
                 task,
@@ -367,6 +436,7 @@ class SafeEditingService:
                 exc.error_code,
                 exc.message,
                 exc.stage,
+                integrity,
             )
         except Exception as exc:
             stage = "testing" if task.status == TaskStatus.TESTING else "patch_apply"
@@ -381,6 +451,7 @@ class SafeEditingService:
                 error_code,
                 str(exc),
                 stage,
+                integrity,
             )
 
         patch.validation_status = PatchValidationStatus.APPLIED
@@ -395,8 +466,10 @@ class SafeEditingService:
             tests_passed=True,
             rollback_triggered=False,
             rollback_succeeded=None,
+            rollback_error=None,
             final_status=TaskStatus.SUCCEEDED,
             failure_stage=None,
+            integrity=integrity,
         )
         self.storage.update_task(task)
         self.storage.transition_status(task, TaskStatus.SUCCEEDED)
@@ -413,6 +486,7 @@ class SafeEditingService:
         error_code: str,
         error_message: str,
         failure_stage: str,
+        integrity: _ExecutionIntegrity,
     ) -> TaskRecord:
         self.storage.transition_status(task, TaskStatus.ROLLING_BACK)
         rollback_succeeded = False
@@ -426,14 +500,31 @@ class SafeEditingService:
                 task.source_repo_path,
             )
             task.workspace_path = str(restored)
-            rollback_succeeded = self.workspace_manager.workspace_matches_source(
-                restored,
-                task.source_repo_path,
+            restored_manifest = self.workspace_manager.manifest(restored)
+            integrity.final_manifest = restored_manifest
+            integrity.source_manifest_after = self.workspace_manager.manifest(
+                task.source_repo_path
+            )
+            rollback_succeeded = (
+                restored_manifest == integrity.baseline_manifest
+                and integrity.source_manifest_after == integrity.source_manifest_before
             )
             if not rollback_succeeded:
-                rollback_error = "Restored workspace does not match the source repository."
+                rollback_error = (
+                    "Restored workspace or source repository does not match the execution baseline."
+                )
         except (OSError, WorkspaceError) as exc:
             rollback_error = str(exc)
+        if integrity.source_manifest_after is None and task.source_repo_path is not None:
+            try:
+                integrity.source_manifest_after = self.workspace_manager.manifest(
+                    task.source_repo_path
+                )
+            except (OSError, WorkspaceError) as exc:
+                source_error = f"Source integrity could not be verified: {exc}"
+                rollback_error = (
+                    f"{rollback_error} {source_error}" if rollback_error else source_error
+                )
 
         self.storage.add_log(
             StepLog(
@@ -457,8 +548,10 @@ class SafeEditingService:
             tests_passed=False,
             rollback_triggered=True,
             rollback_succeeded=rollback_succeeded,
+            rollback_error=rollback_error,
             final_status=TaskStatus.FAILED,
             failure_stage=failure_stage,
+            integrity=integrity,
         )
         self.storage.update_task(task)
         self.storage.transition_status(
@@ -481,8 +574,10 @@ class SafeEditingService:
         tests_passed: bool,
         rollback_triggered: bool,
         rollback_succeeded: bool | None,
+        rollback_error: str | None,
         final_status: TaskStatus,
         failure_stage: str | None,
+        integrity: _ExecutionIntegrity,
     ) -> ExecutionReport:
         result = task.result
         report_command = command_spec.model_copy(update={"env_overrides": {}})
@@ -498,6 +593,37 @@ class SafeEditingService:
             tests_passed=tests_passed,
             rollback_triggered=rollback_triggered,
             rollback_succeeded=rollback_succeeded,
+            rollback_error=rollback_error,
+            baseline_manifest_hash=WorkspaceManager.manifest_hash(
+                integrity.baseline_manifest
+            ),
+            expected_manifest_hash=(
+                WorkspaceManager.manifest_hash(integrity.expected_manifest)
+                if integrity.expected_manifest is not None
+                else None
+            ),
+            final_manifest_hash=(
+                WorkspaceManager.manifest_hash(integrity.final_manifest)
+                if integrity.final_manifest is not None
+                else None
+            ),
+            source_manifest_before_hash=WorkspaceManager.manifest_hash(
+                integrity.source_manifest_before
+            ),
+            source_manifest_after_hash=(
+                WorkspaceManager.manifest_hash(integrity.source_manifest_after)
+                if integrity.source_manifest_after is not None
+                else None
+            ),
+            source_unchanged=(
+                integrity.source_manifest_after == integrity.source_manifest_before
+                if integrity.source_manifest_after is not None
+                else None
+            ),
+            attempted_files=integrity.attempted_files,
+            replaced_files=integrity.replaced_files,
+            restored_files=integrity.restored_files,
+            restore_errors=integrity.restore_errors,
             final_status=final_status,
             failure_stage=failure_stage,
             risk_notes=result.risk_notes if result else [],

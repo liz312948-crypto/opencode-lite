@@ -160,6 +160,17 @@ class ExecutionReport(BaseModel):
     tests_passed: bool = False
     rollback_triggered: bool = False
     rollback_succeeded: bool | None = None
+    rollback_error: str | None = None
+    baseline_manifest_hash: str | None = None
+    expected_manifest_hash: str | None = None
+    final_manifest_hash: str | None = None
+    source_manifest_before_hash: str | None = None
+    source_manifest_after_hash: str | None = None
+    source_unchanged: bool | None = None
+    attempted_files: list[str] = Field(default_factory=list)
+    replaced_files: list[str] = Field(default_factory=list)
+    restored_files: list[str] = Field(default_factory=list)
+    restore_errors: list[str] = Field(default_factory=list)
     final_status: TaskStatus
     failure_stage: str | None = None
     risk_notes: list[str] = Field(default_factory=list)
