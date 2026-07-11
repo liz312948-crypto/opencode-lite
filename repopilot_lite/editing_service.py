@@ -27,7 +27,7 @@ from repopilot_lite.patching import (
     patch_content_hash,
 )
 from repopilot_lite.runners import CommandPolicyError, CommandRunner, TestRunner
-from repopilot_lite.storage import Storage
+from repopilot_lite.storage import Storage, StorageConflict
 from repopilot_lite.task_locks import TaskLockManager, default_task_lock_manager
 from repopilot_lite.workspace import WorkspaceError, WorkspaceManager, WorkspaceManifest
 
@@ -89,8 +89,11 @@ class SafeEditingService:
         self.task_locks = task_lock_manager or default_task_lock_manager
 
     def submit_patch(self, task: TaskRecord, payload: PatchProposalCreate) -> PatchProposal:
-        with self.task_locks.lock(task.task_id):
-            return self._submit_patch_locked(self._reload_task(task), payload)
+        try:
+            with self.task_locks.lock(task.task_id):
+                return self._submit_patch_locked(self._reload_task(task), payload)
+        except StorageConflict as exc:
+            raise EditingError(409, exc.error_code, str(exc)) from exc
 
     def _submit_patch_locked(
         self,
@@ -116,11 +119,13 @@ class SafeEditingService:
             generated_by=payload.generated_by,
             content_hash=patch_content_hash(payload.unified_diff),
         )
-        self.storage.create_patch(patch)
         task.current_patch_id = patch.id
         task.approved_patch_id = None
-        self.storage.update_task(task)
-        self.storage.transition_status(task, TaskStatus.PATCH_PROPOSED)
+        self.storage.create_patch_and_transition(
+            task,
+            patch,
+            TaskStatus.PATCH_PROPOSED,
+        )
 
         try:
             source = self.workspace_manager.validate_source(task.repo_path)
@@ -129,6 +134,8 @@ class SafeEditingService:
                 source,
                 replace=True,
             )
+            task.source_repo_path = str(source)
+            task.workspace_path = str(workspace)
             parsed_targets = self.patch_applier.validate(workspace, payload.unified_diff)
             if payload.target_files and sorted(payload.target_files) != sorted(parsed_targets):
                 raise PatchValidationError(
@@ -137,12 +144,12 @@ class SafeEditingService:
         except (PatchValidationError, WorkspaceError, OSError) as exc:
             patch.validation_status = PatchValidationStatus.INVALID
             patch.validation_error = str(exc)
-            self.storage.update_patch(patch)
             self.storage.transition_status(
                 task,
                 TaskStatus.FAILED,
                 error_code=getattr(exc, "error_code", "WORKSPACE_SETUP_FAILED"),
                 error_message=str(exc),
+                patch=patch,
             )
             raise EditingError(
                 422,
@@ -154,11 +161,11 @@ class SafeEditingService:
         patch.target_files = parsed_targets
         patch.validation_status = PatchValidationStatus.VALID
         patch.validation_error = None
-        self.storage.update_patch(patch)
-        task.source_repo_path = str(source)
-        task.workspace_path = str(workspace)
-        self.storage.update_task(task)
-        self.storage.transition_status(task, TaskStatus.AWAITING_APPROVAL)
+        self.storage.transition_status(
+            task,
+            TaskStatus.AWAITING_APPROVAL,
+            patch=patch,
+        )
         return patch
 
     def get_current_patch(self, task: TaskRecord) -> PatchProposal:
@@ -174,8 +181,11 @@ class SafeEditingService:
         return patch
 
     def approve_patch(self, task: TaskRecord, decision: PatchApproval) -> PatchProposal:
-        with self.task_locks.lock(task.task_id):
-            return self._approve_patch_locked(self._reload_task(task), decision)
+        try:
+            with self.task_locks.lock(task.task_id):
+                return self._approve_patch_locked(self._reload_task(task), decision)
+        except StorageConflict as exc:
+            raise EditingError(409, exc.error_code, str(exc)) from exc
 
     def _approve_patch_locked(
         self,
@@ -222,23 +232,37 @@ class SafeEditingService:
             and task.approved_patch_id == patch.id
             and patch.approved_hash == current_hash
             and patch.approved_command_hash == command_hash
+            and patch.approved_task_revision == task.revision
         ):
             return patch
 
         patch.validation_status = PatchValidationStatus.APPROVED
         patch.approved_hash = current_hash
         patch.approved_command_hash = command_hash
-        patch.approved_task_revision = task.revision
+        patch.approved_task_revision = task.revision + 1
         patch.approved_at = datetime.now(UTC)
-        self.storage.update_patch(patch)
         task.approved_patch_id = patch.id
-        self.storage.update_task(task)
-        self._log(task, "approval", "APPROVED", "Patch approved for execution.", patch)
+        self.storage.update_task_and_patch(
+            task,
+            patch,
+            logs_to_add=(
+                self._log_entry(
+                    task,
+                    "approval",
+                    "APPROVED",
+                    "Patch approved for execution.",
+                    patch,
+                ),
+            ),
+        )
         return patch
 
     def reject_patch(self, task: TaskRecord, decision: PatchDecision) -> PatchProposal:
-        with self.task_locks.lock(task.task_id):
-            return self._reject_patch_locked(self._reload_task(task), decision)
+        try:
+            with self.task_locks.lock(task.task_id):
+                return self._reject_patch_locked(self._reload_task(task), decision)
+        except StorageConflict as exc:
+            raise EditingError(409, exc.error_code, str(exc)) from exc
 
     def _reject_patch_locked(
         self,
@@ -260,16 +284,29 @@ class SafeEditingService:
         patch.approved_command_hash = None
         patch.approved_task_revision = None
         patch.approved_at = None
-        self.storage.update_patch(patch)
         task.approved_patch_id = None
-        self.storage.update_task(task)
-        self._log(task, "approval", "REJECTED", "Patch rejected by the user.", patch)
-        self.storage.transition_status(task, TaskStatus.CANCELLED)
+        self.storage.transition_status(
+            task,
+            TaskStatus.CANCELLED,
+            patch=patch,
+            additional_logs=(
+                self._log_entry(
+                    task,
+                    "approval",
+                    "REJECTED",
+                    "Patch rejected by the user.",
+                    patch,
+                ),
+            ),
+        )
         return patch
 
     def execute_patch(self, task: TaskRecord) -> TaskRecord:
-        with self.task_locks.lock(task.task_id):
-            return self._execute_patch_locked(self._reload_task(task))
+        try:
+            with self.task_locks.lock(task.task_id):
+                return self._execute_patch_locked(self._reload_task(task))
+        except StorageConflict as exc:
+            raise EditingError(409, exc.error_code, str(exc)) from exc
 
     def _execute_patch_locked(self, task: TaskRecord) -> TaskRecord:
         if (
@@ -291,6 +328,7 @@ class SafeEditingService:
             patch.validation_status != PatchValidationStatus.APPROVED
             or task.approved_patch_id != patch.id
             or patch.approved_hash != patch.content_hash
+            or patch.approved_task_revision != task.revision
         ):
             raise EditingError(
                 409,
@@ -350,35 +388,36 @@ class SafeEditingService:
         modified_files: list[str] = []
         actual_diff = ""
         test_results: list[CommandResult] = []
+        test_log: StepLog | None = None
 
         try:
             modified_files = self.patch_applier.apply(workspace, patch.unified_diff)
             integrity.replaced_files = list(modified_files)
             integrity.expected_manifest = self.workspace_manager.manifest(workspace)
             actual_diff = self.patch_applier.actual_diff(source, workspace, modified_files)
-            self.storage.add_log(
-                StepLog(
-                    task_id=task.task_id,
-                    step="patch_apply",
-                    status="SUCCESS",
-                    message="Approved patch applied inside the task workspace.",
-                    data={"patch_id": patch.id, "modified_files": modified_files},
-                )
+            patch_apply_log = StepLog(
+                task_id=task.task_id,
+                step="patch_apply",
+                status="SUCCESS",
+                message="Approved patch applied inside the task workspace.",
+                data={"patch_id": patch.id, "modified_files": modified_files},
             )
-            self.storage.transition_status(task, TaskStatus.TESTING)
+            self.storage.transition_status(
+                task,
+                TaskStatus.TESTING,
+                additional_logs=(patch_apply_log,),
+            )
 
             command_result = CommandRunner(workspace).run(command_spec)
             test_results.append(command_result)
-            self.storage.add_log(
-                StepLog(
-                    task_id=task.task_id,
-                    step="test_runner",
-                    status="FAILED"
-                    if command_result.timed_out or command_result.exit_code != 0
-                    else "SUCCESS",
-                    message="Test command completed.",
-                    data=command_result.model_dump(mode="json"),
-                )
+            test_log = StepLog(
+                task_id=task.task_id,
+                step="test_runner",
+                status="FAILED"
+                if command_result.timed_out or command_result.exit_code != 0
+                else "SUCCESS",
+                message="Test command completed.",
+                data=command_result.model_dump(mode="json"),
             )
             if command_result.timed_out:
                 raise _ExecutionFailure(
@@ -424,6 +463,7 @@ class SafeEditingService:
                 str(exc),
                 "patch_apply",
                 integrity,
+                test_log,
             )
         except _ExecutionFailure as exc:
             return self._rollback_failure(
@@ -437,6 +477,7 @@ class SafeEditingService:
                 exc.message,
                 exc.stage,
                 integrity,
+                test_log,
             )
         except Exception as exc:
             stage = "testing" if task.status == TaskStatus.TESTING else "patch_apply"
@@ -452,10 +493,10 @@ class SafeEditingService:
                 str(exc),
                 stage,
                 integrity,
+                test_log,
             )
 
         patch.validation_status = PatchValidationStatus.APPLIED
-        self.storage.update_patch(patch)
         task.execution_report = self._build_report(
             task=task,
             patch=patch,
@@ -471,8 +512,12 @@ class SafeEditingService:
             failure_stage=None,
             integrity=integrity,
         )
-        self.storage.update_task(task)
-        self.storage.transition_status(task, TaskStatus.SUCCEEDED)
+        self.storage.transition_status(
+            task,
+            TaskStatus.SUCCEEDED,
+            patch=patch,
+            additional_logs=(test_log,) if test_log is not None else (),
+        )
         return self.storage.get_task(task.task_id) or task
 
     def _rollback_failure(
@@ -487,8 +532,13 @@ class SafeEditingService:
         error_message: str,
         failure_stage: str,
         integrity: _ExecutionIntegrity,
+        test_log: StepLog | None = None,
     ) -> TaskRecord:
-        self.storage.transition_status(task, TaskStatus.ROLLING_BACK)
+        self.storage.transition_status(
+            task,
+            TaskStatus.ROLLING_BACK,
+            additional_logs=(test_log,) if test_log is not None else (),
+        )
         rollback_succeeded = False
         rollback_error: str | None = None
 
@@ -526,14 +576,12 @@ class SafeEditingService:
                     f"{rollback_error} {source_error}" if rollback_error else source_error
                 )
 
-        self.storage.add_log(
-            StepLog(
-                task_id=task.task_id,
-                step="rollback",
-                status="SUCCESS" if rollback_succeeded else "FAILED",
-                message=rollback_error or "Workspace restored from the source repository.",
-                data={"patch_id": patch.id, "rollback_succeeded": rollback_succeeded},
-            )
+        rollback_log = StepLog(
+            task_id=task.task_id,
+            step="rollback",
+            status="SUCCESS" if rollback_succeeded else "FAILED",
+            message=rollback_error or "Workspace restored from the source repository.",
+            data={"patch_id": patch.id, "rollback_succeeded": rollback_succeeded},
         )
         if rollback_error:
             error_message = f"{error_message} Rollback issue: {rollback_error}"
@@ -553,12 +601,12 @@ class SafeEditingService:
             failure_stage=failure_stage,
             integrity=integrity,
         )
-        self.storage.update_task(task)
         self.storage.transition_status(
             task,
             TaskStatus.FAILED,
             error_code=error_code,
             error_message=error_message,
+            additional_logs=(rollback_log,),
         )
         return self.storage.get_task(task.task_id) or task
 
@@ -644,8 +692,7 @@ class SafeEditingService:
         patch.approved_task_revision = None
         patch.approved_at = None
         task.approved_patch_id = None
-        self.storage.update_patch(patch)
-        self.storage.update_task(task)
+        self.storage.update_task_and_patch(task, patch)
 
     @staticmethod
     def _command_spec_hash(command_spec: CommandSpec) -> str:
@@ -677,20 +724,18 @@ class SafeEditingService:
             raise EditingError(404, "PATCH_NOT_FOUND", "Patch proposal was not found.")
         return patch
 
-    def _log(
-        self,
+    @staticmethod
+    def _log_entry(
         task: TaskRecord,
         step: str,
         status: str,
         message: str,
         patch: PatchProposal,
-    ) -> None:
-        self.storage.add_log(
-            StepLog(
-                task_id=task.task_id,
-                step=step,
-                status=status,
-                message=message,
-                data={"patch_id": patch.id, "content_hash": patch.content_hash},
-            )
+    ) -> StepLog:
+        return StepLog(
+            task_id=task.task_id,
+            step=step,
+            status=status,
+            message=message,
+            data={"patch_id": patch.id, "content_hash": patch.content_hash},
         )

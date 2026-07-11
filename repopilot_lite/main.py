@@ -64,15 +64,15 @@ def create_task(payload: TaskCreate, store: Storage = Depends(get_storage)) -> T
         test_command=payload.test_command,
         test_timeout_seconds=payload.test_timeout_seconds,
     )
-    store.create_task(task)
-    store.add_log(
+    store.create_task_with_log(
+        task,
         StepLog(
             task_id=task.task_id,
             step="state",
             status="CREATED",
             message="Task created in PENDING state.",
             data={"to_status": TaskStatus.PENDING.value},
-        )
+        ),
     )
     return TaskCreated(task_id=task.task_id, status=task.status)
 
@@ -111,7 +111,6 @@ def _run_task_locked(
         task.execution_report = None
         task.current_patch_id = None
         task.approved_patch_id = None
-        store.update_task(task)
     except Exception as exc:
         store.transition_status(
             task,

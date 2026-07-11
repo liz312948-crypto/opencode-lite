@@ -43,12 +43,18 @@ class Executor:
             task.result = TaskResult.model_validate(result)
             self.storage.transition_status(task, TaskStatus.SUCCESS)
         except Exception as exc:
-            self._log(task, "executor", "FAILED", str(exc))
+            failure_log = StepLog(
+                task_id=task.task_id,
+                step="executor",
+                status="FAILED",
+                message=str(exc),
+            )
             self.storage.transition_status(
                 task,
                 TaskStatus.FAILED,
                 error_code="EXECUTOR_FAILED",
                 error_message=str(exc),
+                additional_logs=(failure_log,),
             )
 
         return self.storage.get_task(task.task_id) or task
