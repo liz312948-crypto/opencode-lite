@@ -385,5 +385,5 @@ Planned directions, not current capabilities:
 ## Project History
 
 The project was previously named RepoPilot-Lite. The
-[v0.2 Product Walkthrough](https://github.com/liz312948-crypto/RepoPilot-Lite/releases/download/v0.2.0/RepoPilot-Lite-v0.2-Product-Walkthrough.mp4)
+[v0.2 Product Walkthrough](https://github.com/liz312948-crypto/opencode-lite/releases/download/v0.2.0/RepoPilot-Lite-v0.2-Product-Walkthrough.mp4)
 shows the earlier repository-understanding and modification-planning prototype.

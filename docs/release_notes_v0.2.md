@@ -2,7 +2,7 @@
 
 RepoPilot-Lite v0.2.0 packages the project as a lightweight Coding Agent backend prototype for repository understanding and modification planning.
 
-Product Walkthrough: [RepoPilot-Lite v0.2 Product Walkthrough](https://github.com/liz312948-crypto/RepoPilot-Lite/releases/download/v0.2.0/RepoPilot-Lite-v0.2-Product-Walkthrough.mp4)
+Product Walkthrough: [RepoPilot-Lite v0.2 Product Walkthrough](https://github.com/liz312948-crypto/opencode-lite/releases/download/v0.2.0/RepoPilot-Lite-v0.2-Product-Walkthrough.mp4)
 
 ## Highlights
 
