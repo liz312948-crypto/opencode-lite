@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -8,6 +10,7 @@ from repopilot_lite.models import (
     CommandResult,
     CommandSpec,
     ExecutionReport,
+    PatchApproval,
     PatchDecision,
     PatchProposal,
     PatchProposalCreate,
@@ -19,6 +22,7 @@ from repopilot_lite.models import (
 from repopilot_lite.patching import PatchApplier, PatchValidationError, patch_content_hash
 from repopilot_lite.runners import CommandPolicyError, CommandRunner, TestRunner
 from repopilot_lite.storage import Storage
+from repopilot_lite.task_locks import TaskLockManager, default_task_lock_manager
 from repopilot_lite.workspace import WorkspaceError, WorkspaceManager
 
 
@@ -57,13 +61,23 @@ class SafeEditingService:
         workspace_manager: WorkspaceManager,
         patch_applier: PatchApplier | None = None,
         test_runner: TestRunner | None = None,
+        task_lock_manager: TaskLockManager | None = None,
     ) -> None:
         self.storage = storage
         self.workspace_manager = workspace_manager
         self.patch_applier = patch_applier or PatchApplier()
         self.test_runner = test_runner or TestRunner()
+        self.task_locks = task_lock_manager or default_task_lock_manager
 
     def submit_patch(self, task: TaskRecord, payload: PatchProposalCreate) -> PatchProposal:
+        with self.task_locks.lock(task.task_id):
+            return self._submit_patch_locked(self._reload_task(task), payload)
+
+    def _submit_patch_locked(
+        self,
+        task: TaskRecord,
+        payload: PatchProposalCreate,
+    ) -> PatchProposal:
         if task.status not in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             raise EditingError(
                 409,
@@ -129,6 +143,10 @@ class SafeEditingService:
         return patch
 
     def get_current_patch(self, task: TaskRecord) -> PatchProposal:
+        with self.task_locks.lock(task.task_id):
+            return self._get_current_patch_locked(self._reload_task(task))
+
+    def _get_current_patch_locked(self, task: TaskRecord) -> PatchProposal:
         if task.current_patch_id is None:
             raise EditingError(404, "PATCH_NOT_FOUND", "Task has no patch proposal.")
         patch = self.storage.get_patch(task.current_patch_id)
@@ -136,33 +154,62 @@ class SafeEditingService:
             raise EditingError(404, "PATCH_NOT_FOUND", "Current patch proposal was not found.")
         return patch
 
-    def approve_patch(self, task: TaskRecord, decision: PatchDecision) -> PatchProposal:
+    def approve_patch(self, task: TaskRecord, decision: PatchApproval) -> PatchProposal:
+        with self.task_locks.lock(task.task_id):
+            return self._approve_patch_locked(self._reload_task(task), decision)
+
+    def _approve_patch_locked(
+        self,
+        task: TaskRecord,
+        decision: PatchApproval,
+    ) -> PatchProposal:
         patch = self._require_decision_patch(task, decision)
-        if (
-            patch.validation_status == PatchValidationStatus.APPROVED
-            and task.approved_patch_id == patch.id
-        ):
-            return patch
         if task.status != TaskStatus.AWAITING_APPROVAL:
             raise EditingError(
                 409,
                 "APPROVAL_NOT_ALLOWED",
                 f"A patch cannot be approved from status {task.status}.",
             )
-        if patch.validation_status != PatchValidationStatus.VALID:
+        if patch.validation_status not in {
+            PatchValidationStatus.VALID,
+            PatchValidationStatus.APPROVED,
+        }:
             raise EditingError(409, "PATCH_NOT_VALID", "Only a valid patch can be approved.")
-        if patch.content_hash != patch_content_hash(patch.unified_diff):
+        current_hash = patch_content_hash(patch.unified_diff)
+        if patch.content_hash != current_hash:
             raise EditingError(409, "PATCH_CONTENT_CHANGED", "Patch content hash has changed.")
+        if decision.expected_content_hash != current_hash:
+            raise EditingError(
+                409,
+                "PATCH_CONTENT_CHANGED",
+                "The patch content no longer matches the reviewed SHA-256.",
+            )
         if task.workspace_path is None:
             raise EditingError(409, "WORKSPACE_NOT_FOUND", "Task workspace is not available.")
 
         try:
             self.patch_applier.validate(task.workspace_path, patch.unified_diff)
-        except PatchValidationError as exc:
+            command_spec = self.test_runner.select_command(
+                task.workspace_path,
+                task.test_command,
+                task.test_timeout_seconds,
+            )
+        except (PatchValidationError, CommandPolicyError) as exc:
             raise EditingError(422, exc.error_code, str(exc), patch_id=patch.id) from exc
 
+        command_hash = self._command_spec_hash(command_spec)
+        if (
+            patch.validation_status == PatchValidationStatus.APPROVED
+            and task.approved_patch_id == patch.id
+            and patch.approved_hash == current_hash
+            and patch.approved_command_hash == command_hash
+        ):
+            return patch
+
         patch.validation_status = PatchValidationStatus.APPROVED
-        patch.approved_hash = patch.content_hash
+        patch.approved_hash = current_hash
+        patch.approved_command_hash = command_hash
+        patch.approved_task_revision = task.revision
         patch.approved_at = datetime.now(UTC)
         self.storage.update_patch(patch)
         task.approved_patch_id = patch.id
@@ -171,6 +218,14 @@ class SafeEditingService:
         return patch
 
     def reject_patch(self, task: TaskRecord, decision: PatchDecision) -> PatchProposal:
+        with self.task_locks.lock(task.task_id):
+            return self._reject_patch_locked(self._reload_task(task), decision)
+
+    def _reject_patch_locked(
+        self,
+        task: TaskRecord,
+        decision: PatchDecision,
+    ) -> PatchProposal:
         patch = self._require_decision_patch(task, decision)
         if patch.validation_status == PatchValidationStatus.REJECTED:
             return patch
@@ -183,6 +238,8 @@ class SafeEditingService:
 
         patch.validation_status = PatchValidationStatus.REJECTED
         patch.approved_hash = None
+        patch.approved_command_hash = None
+        patch.approved_task_revision = None
         patch.approved_at = None
         self.storage.update_patch(patch)
         task.approved_patch_id = None
@@ -192,7 +249,15 @@ class SafeEditingService:
         return patch
 
     def execute_patch(self, task: TaskRecord) -> TaskRecord:
-        if task.status == TaskStatus.SUCCEEDED and task.execution_report is not None:
+        with self.task_locks.lock(task.task_id):
+            return self._execute_patch_locked(self._reload_task(task))
+
+    def _execute_patch_locked(self, task: TaskRecord) -> TaskRecord:
+        if (
+            task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
+            and task.execution_report is not None
+            and task.execution_report.patch_id == task.current_patch_id
+        ):
             return task
         if task.status != TaskStatus.AWAITING_APPROVAL:
             raise EditingError(
@@ -201,7 +266,8 @@ class SafeEditingService:
                 f"An approved patch cannot be executed from status {task.status}.",
             )
 
-        patch = self.get_current_patch(task)
+        patch = self._get_current_patch_locked(task)
+        current_hash = patch_content_hash(patch.unified_diff)
         if (
             patch.validation_status != PatchValidationStatus.APPROVED
             or task.approved_patch_id != patch.id
@@ -212,13 +278,17 @@ class SafeEditingService:
                 "PATCH_NOT_APPROVED",
                 "The task's current patch has not been approved.",
             )
-        if patch.content_hash != patch_content_hash(patch.unified_diff):
+        if patch.content_hash != current_hash:
+            self._invalidate_approval(task, patch)
             raise EditingError(409, "PATCH_CONTENT_CHANGED", "Approved patch content has changed.")
         if task.workspace_path is None or task.source_repo_path is None:
             raise EditingError(409, "WORKSPACE_NOT_FOUND", "Task workspace is not available.")
 
         try:
-            workspace = self.workspace_manager.validate_workspace(task.workspace_path)
+            workspace = self.workspace_manager.validate_workspace(
+                task.workspace_path,
+                task_id=task.task_id,
+            )
             source = self.workspace_manager.validate_source(task.source_repo_path)
             self.patch_applier.validate(workspace, patch.unified_diff)
             command_spec = self.test_runner.select_command(
@@ -233,6 +303,14 @@ class SafeEditingService:
                 str(exc),
                 patch_id=patch.id,
             ) from exc
+
+        if patch.approved_command_hash != self._command_spec_hash(command_spec):
+            self._invalidate_approval(task, patch)
+            raise EditingError(
+                409,
+                "APPROVED_COMMAND_CHANGED",
+                "The approved test command has changed and must be approved again.",
+            )
 
         self.storage.transition_status(task, TaskStatus.APPLYING_PATCH)
         modified_files: list[str] = []
@@ -426,6 +504,35 @@ class SafeEditingService:
             suggestions=result.suggestions if result else [],
             llm_used=result.llm_used if result else False,
         )
+
+    def _reload_task(self, task: TaskRecord) -> TaskRecord:
+        current = self.storage.get_task(task.task_id)
+        if current is None:
+            raise EditingError(404, "TASK_NOT_FOUND", "Task was not found.")
+        return current
+
+    def _invalidate_approval(self, task: TaskRecord, patch: PatchProposal) -> None:
+        patch.validation_status = PatchValidationStatus.VALID
+        patch.approved_hash = None
+        patch.approved_command_hash = None
+        patch.approved_task_revision = None
+        patch.approved_at = None
+        task.approved_patch_id = None
+        self.storage.update_patch(patch)
+        self.storage.update_task(task)
+
+    @staticmethod
+    def _command_spec_hash(command_spec: CommandSpec) -> str:
+        payload = json.dumps(
+            {
+                "argv": command_spec.argv,
+                "timeout_seconds": command_spec.timeout_seconds,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _require_decision_patch(
         self,

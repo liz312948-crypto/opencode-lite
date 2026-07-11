@@ -99,6 +99,10 @@ class CommandResult(BaseModel):
     stderr: str = ""
     timed_out: bool = False
     output_truncated: bool = False
+    process_tree_terminated: bool | None = None
+    termination_error: str | None = None
+    stdout_bytes_discarded: int = 0
+    stderr_bytes_discarded: int = 0
     duration_ms: int = 0
     started_at: datetime
     finished_at: datetime
@@ -116,6 +120,15 @@ class PatchDecision(BaseModel):
     patch_id: str = Field(..., min_length=1)
 
 
+class PatchApproval(PatchDecision):
+    expected_content_hash: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
 class PatchProposal(BaseModel):
     id: str
     task_id: str
@@ -130,6 +143,8 @@ class PatchProposal(BaseModel):
     validation_error: str | None = None
     content_hash: str
     approved_hash: str | None = None
+    approved_command_hash: str | None = None
+    approved_task_revision: int | None = None
     approved_at: datetime | None = None
 
 
@@ -165,6 +180,7 @@ class TaskRecord(BaseModel):
     workspace_path: str | None = None
     current_patch_id: str | None = None
     approved_patch_id: str | None = None
+    revision: int = Field(default=0, ge=0)
     test_command: list[str] | None = None
     test_timeout_seconds: int = Field(default=60, ge=1, le=300)
     error: str | None = None

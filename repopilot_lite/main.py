@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from repopilot_lite.editing_service import EditingError, SafeEditingService
 from repopilot_lite.executor import Executor
 from repopilot_lite.models import (
+    PatchApproval,
     PatchDecision,
     PatchProposal,
     PatchProposalCreate,
@@ -19,6 +20,7 @@ from repopilot_lite.models import (
 )
 from repopilot_lite.planner import Planner
 from repopilot_lite.storage import Storage
+from repopilot_lite.task_locks import default_task_lock_manager
 from repopilot_lite.tools import ToolRegistry, create_default_registry
 from repopilot_lite.workspace import WorkspaceManager
 
@@ -82,7 +84,17 @@ def run_task(
     task_planner: Planner = Depends(get_planner),
     registry: ToolRegistry = Depends(get_tool_registry),
 ) -> TaskRecord:
-    task = _get_task_or_404(task_id, store)
+    with default_task_lock_manager.lock(task_id):
+        task = _get_task_or_404(task_id, store)
+        return _run_task_locked(task, store, task_planner, registry)
+
+
+def _run_task_locked(
+    task: TaskRecord,
+    store: Storage,
+    task_planner: Planner,
+    registry: ToolRegistry,
+) -> TaskRecord:
 
     if task.status in {TaskStatus.SUCCESS, TaskStatus.SUCCEEDED}:
         return task
@@ -161,7 +173,7 @@ def get_task_diff(
 @app.post("/tasks/{task_id}/approve", response_model=PatchProposal)
 def approve_task_patch(
     task_id: str,
-    payload: PatchDecision,
+    payload: PatchApproval,
     store: Storage = Depends(get_storage),
     manager: WorkspaceManager = Depends(get_workspace_manager),
 ) -> PatchProposal:
