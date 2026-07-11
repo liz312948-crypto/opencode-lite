@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -65,14 +66,17 @@ def test_patch_review_and_approval_bind_exact_patch(
 
     wrong_approval = client.post(
         f"/tasks/{task_id}/approve",
-        json={"patch_id": "wrong-patch"},
+        json={"patch_id": "wrong-patch", "expected_content_hash": proposal["content_hash"]},
     )
     assert wrong_approval.status_code == 409
     assert wrong_approval.json()["detail"]["error_code"] == "PATCH_ID_MISMATCH"
 
     approval = client.post(
         f"/tasks/{task_id}/approve",
-        json={"patch_id": proposal["id"]},
+        json={
+            "patch_id": proposal["id"],
+            "expected_content_hash": proposal["content_hash"],
+        },
     )
     assert approval.status_code == 200
     assert approval.json()["validation_status"] == "APPROVED"
@@ -126,7 +130,11 @@ def test_invalid_patch_is_persisted_and_reported(
 def _create_analyzed_task(client: TestClient, repo: Path) -> str:
     created = client.post(
         "/tasks",
-        json={"repo_path": str(repo), "question": "Fix the add function"},
+        json={
+            "repo_path": str(repo),
+            "question": "Fix the add function",
+            "test_command": [sys.executable, "-m", "pytest", "-q"],
+        },
     ).json()
     response = client.post(f"/tasks/{created['task_id']}/run")
     assert response.status_code == 200

@@ -178,7 +178,10 @@ def _submit_and_approve(
     patch = proposal.json()
     approval = client.post(
         f"/tasks/{task_id}/approve",
-        json={"patch_id": patch["id"]},
+        json={
+            "patch_id": patch["id"],
+            "expected_content_hash": patch["content_hash"],
+        },
     )
     assert approval.status_code == 200
     return patch
