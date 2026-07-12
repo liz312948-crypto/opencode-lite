@@ -118,7 +118,8 @@ journal, replaces every target, then removes the journal. Initialization and eve
 public read complete an interrupted journal before returning data.
 
 An in-process storage `RLock`, per-task workflow locks, and monotonic task revisions
-prevent thread interleaving and stale overwrites. This is intentionally not a
+prevent thread interleaving and stale overwrites when all callers use the application's
+single shared `Storage` instance. This is intentionally not a multi-instance,
 multi-process transaction or lease model; v0.3 must run with one Uvicorn worker.
 
 ## Core Invariants

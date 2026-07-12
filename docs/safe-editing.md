@@ -158,9 +158,10 @@ replace. Changes spanning task, patch, and logs first persist a redo journal; ev
 read completes an interrupted journal before returning data. Candidate models are
 copied and synchronized back to callers only after durable write success.
 
-This design supports concurrent threads in one process only. Run exactly one Uvicorn
-worker. It does not provide a cross-process lock, distributed lease, or durable command
-supervisor.
+This design supports concurrent threads using the application's single shared
+`Storage` instance in one process only. Run exactly one Uvicorn worker. It does not
+provide coordination between multiple `Storage` instances, a cross-process lock,
+distributed lease, or durable command supervisor.
 
 ## Residual Risks
 
@@ -168,10 +169,10 @@ supervisor.
   sandbox.
 - A same-account process that changes directory topology in the final filesystem-call
   window remains outside what portable path/identity revalidation can make atomic.
-- A whole API-process crash may leave a task in `APPLYING_PATCH`, `TESTING`, or
-  `ROLLING_BACK`. The JSON journal recovers record bundles, but v0.3 does not
-  automatically reconcile in-flight filesystem/process work; inspect/reset it before
-  retrying.
+- A whole API-process crash may leave a task in `PATCH_PROPOSED`, `APPLYING_PATCH`,
+  `TESTING`, or `ROLLING_BACK`. The JSON journal recovers record bundles, but v0.3 has
+  no API that reconciles in-flight filesystem/process work; an operator must inspect
+  and reset the workspace and manually reconcile the task record.
 - JSON records can be edited by an operator outside the process; hashes and path checks
   detect patch tampering at execution time but JSON Storage is not an access-control
   system.

@@ -392,8 +392,9 @@ OpenCode-Lite/
 ## Known Limitations
 
 - Synchronous API execution blocks the request while analysis or tests run.
-- JSON Storage and task locks support one application process and one Uvicorn worker;
-  multiple workers or distributed execution are unsupported.
+- JSON Storage and task locks support one application process, one Uvicorn worker, and
+  the application's single shared `Storage` instance; multiple instances, workers, or
+  distributed execution are unsupported.
 - Workspace copy cost grows with repository size.
 - Rollback recreates the workspace from the source instead of preserving every failed
   intermediate byte. Reports retain the patch, bounded test output, apply ledger, and
@@ -404,9 +405,10 @@ OpenCode-Lite/
 - Windows commands fail closed unless they can be assigned to a kill-on-close Job
   Object; POSIX uses a new process group. Code that escapes those OS primitives is
   outside the v0.3 trusted-repository boundary.
-- A whole application-process crash can leave an in-flight task in a transitional
-  state; the redo journal protects JSON bundles but is not a durable execution
-  supervisor. Inspect and reset such a task workspace before retrying.
+- A whole application-process crash can leave an in-flight task in `PATCH_PROPOSED`,
+  `APPLYING_PATCH`, `TESTING`, or `ROLLING_BACK`; the redo journal protects JSON bundles
+  but is not a durable execution supervisor. v0.3 has no reconciliation API, so an
+  operator must inspect/reset the workspace and manually reconcile the task record.
 - Logs have no automatic retention or rotation policy in this alpha and may include
   bounded stdout/stderr, README excerpts, search matches, and local paths.
 - The patch parser intentionally supports a conservative subset of unified diff.
