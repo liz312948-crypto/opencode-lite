@@ -19,6 +19,8 @@ All notable changes to this project are documented in this file.
 - Structured ExecutionReport data on task responses.
 - Unit, integration, and end-to-end coverage for isolation and safety boundaries.
 - Architecture, safe-editing, API example, and implementation-plan documentation.
+- Windows Job Object and POSIX process-group cleanup evidence.
+- Revision conflict detection and redo-journal recovery for JSON record bundles.
 
 ### Changed
 
@@ -26,6 +28,10 @@ All notable changes to this project are documented in this file.
 - Version advanced from `0.2.0` to PEP 440 version `0.3.0a1`.
 - `POST /tasks` accepts optional test command and timeout fields.
 - JSON Storage now persists patch records in `data/patches.json`.
+- JSON writes now use unique temporary files, flush/fsync, atomic replace, and a
+  recoverable cross-record journal; model state changes only after a successful write.
+- Approval requests now return the reviewed Patch SHA-256 and stale approval tuples are
+  invalidated instead of silently refreshing changed execution context.
 - Runtime quality checks now include Ruff and Mypy.
 
 ### Compatibility
@@ -41,9 +47,14 @@ All notable changes to this project are documented in this file.
 - Source repositories are never patch or command targets.
 - Patch paths, size, file count, hunk count, context, and workspace containment are
   validated before writes.
-- Unapproved or changed patches cannot execute.
-- Commands use `shell=False`, an allowlisted shape, a workspace cwd, and a timeout.
-- Failure and timeout trigger workspace recreation and restoration verification.
+- Symlinks, junctions, reparse points, duplicate physical targets, and changed path/file
+  identities are rejected.
+- Unapproved, changed, or stale-revision patches cannot execute; approval also binds the
+  normalized command hash.
+- Commands use `shell=False`, an allowlisted shape, a workspace cwd, streaming output
+  limits, a timeout, and bounded process-tree termination.
+- Failure, timeout, post-test workspace drift, or cleanup uncertainty trigger workspace
+  recreation; rollback success requires baseline/source manifests and cleanup evidence.
 
 ## v0.2.0
 

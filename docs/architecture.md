@@ -20,10 +20,12 @@ The internal package is still named `repopilot_lite` for import compatibility.
 | `llm_client.py` | Optional OpenAI-compatible summarizer; returns `None` on failure |
 | `state_machine.py` | Single declaration of legal task status transitions |
 | `workspace.py` | Source validation, isolated copy, reset, cleanup, and hash comparison |
+| `filesystem_safety.py` | No-follow traversal, reparse detection, identity checks, manifests |
 | `patching.py` | Unified-diff parsing, containment checks, dry run, apply, actual diff |
 | `runners.py` | argv-based CommandRunner and allowlisted TestRunner |
 | `editing_service.py` | Patch lifecycle, approval gate, execution, report, and rollback |
-| `storage.py` | JSON persistence and observable state-transition logs |
+| `task_locks.py` | Bounded per-task serialization within one application process |
+| `storage.py` | Revisioned JSON persistence, redo journal, and transition logs |
 
 ## Analysis Data Flow
 
@@ -72,16 +74,17 @@ sequenceDiagram
     Editing->>Patch: parse + dry-run validate
     Editing->>Storage: PATCH_PROPOSED -> AWAITING_APPROVAL
     Client->>API: GET /tasks/{id}/diff
-    Client->>API: POST /tasks/{id}/approve
-    Editing->>Patch: revalidate hash and dry run
-    Editing->>Storage: save explicit approval
+    Client->>API: POST /tasks/{id}/approve (patch ID + reviewed SHA-256)
+    Editing->>Patch: revalidate hash, targets, command, and dry run
+    Editing->>Storage: bundle approval tuple + audit log
     Client->>API: POST /tasks/{id}/execute
+    Editing->>Editing: capture source/workspace baseline manifests
     Editing->>Storage: APPLYING_PATCH
     Editing->>Patch: apply in workspace + actual diff
     Editing->>Storage: TESTING
     Editing->>Runner: one allowlisted command
     alt Tests pass
-        Editing->>Storage: report + SUCCEEDED
+        Editing->>Storage: final manifest report + patch APPLIED + SUCCEEDED
     else Failure or timeout
         Editing->>Storage: ROLLING_BACK
         Editing->>Workspace: delete and recopy source
@@ -91,10 +94,12 @@ sequenceDiagram
 
 ## State Ownership
 
-Business modules do not assign `task.status` directly. `Storage.transition_status`
-calls the state machine, persists the task, and appends a transition log. Approval does
-not advance the task out of `AWAITING_APPROVAL`; it updates the immutable patch record.
-Only `/execute` can move an approved task to `APPLYING_PATCH`.
+Business modules do not persist `task.status` directly. `Storage.transition_status`
+calls the state machine and bundles the task revision with its transition log; ordinary
+update methods reject status changes. Candidate models are synchronized back to callers
+only after the write succeeds. Approval does not advance the task out of
+`AWAITING_APPROVAL`; it bundles task, immutable patch metadata, and its audit log. Only
+`/execute` can move an approved task to `APPLYING_PATCH`.
 
 `SUCCESS` is retained for the v0.2-compatible analysis endpoint. `SUCCEEDED` is the
 successful terminal state for the safe-editing workflow.
@@ -107,16 +112,29 @@ Three JSON objects are stored under `data/`:
 - `logs.json`: ordered `StepLog` arrays keyed by task ID.
 - `patches.json`: immutable patch text plus validation and approval metadata.
 
-Writes use a temporary sibling file followed by `Path.replace`. An in-process `RLock`
-prevents concurrent threads from interleaving writes. This is intentionally not a
-multi-process transaction model.
+Each single-file write uses a unique sibling temporary file, flush, best-effort fsync,
+and `os.replace`. A task/patch/log bundle first writes `transaction.json` as a redo
+journal, replaces every target, then removes the journal. Initialization and every
+public read complete an interrupted journal before returning data.
+
+An in-process storage `RLock`, per-task workflow locks, and monotonic task revisions
+prevent thread interleaving and stale overwrites. This is intentionally not a
+multi-process transaction or lease model; v0.3 must run with one Uvicorn worker.
 
 ## Core Invariants
 
-1. `repo_path` is never a patch or command cwd.
-2. Every editable file resolves below the task workspace.
-3. Every executed patch has a current approval matching its ID and content hash.
-4. Every command uses argv, `shell=False`, a timeout, and workspace-contained cwd.
-5. Every execution attempt yields either a success report or a partial failure report.
-6. Every post-apply failure attempts rollback before the task reaches `FAILED`.
-7. Search, patch, and test behavior have explicit execution bounds.
+1. Harness-managed writes never use `repo_path` as a patch, reset, cleanup, or cwd
+   target; trusted test code is explicitly outside this OS-level guarantee.
+2. Every editable file is no-follow validated below the task workspace, and all
+   symlink/junction/reparse entries are rejected.
+3. Every executed patch has a current approval matching patch ID, content SHA-256,
+   normalized command hash, and task revision.
+4. Every command uses argv, `shell=False`, a timeout, workspace-contained cwd, bounded
+   streaming output, and a POSIX process group or Windows Job Object.
+5. `SUCCEEDED` requires the post-test workspace manifest to equal the approved
+   post-patch manifest and the source before/after manifests to match.
+6. `rollback_succeeded=true` requires the restored manifest to equal the execution
+   baseline, the source to remain unchanged, and process cleanup evidence not to fail.
+7. Task/patch/report/status/log bundles are redo-journal recoverable; whole-process
+   recovery of an in-flight command remains a documented v0.3 limitation.
+8. Search, patch, command, and test behavior have explicit execution bounds.

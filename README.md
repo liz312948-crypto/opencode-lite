@@ -50,14 +50,16 @@ execution.
 - Existing Planner, Executor, ToolRegistry, JSON Storage, and bounded search retry.
 - Optional OpenAI-compatible repository summarizer with deterministic rule fallback.
 - Explicit task state machine with validated transitions and transition logs.
-- Per-task temporary workspace that never writes to the submitted source repository.
+- Per-task temporary workspace; harness-managed patch, reset, and cleanup writes never
+  target the submitted source repository.
 - Text unified-diff validation, dry run, path containment, and exact diff preview.
 - Human approval bound to both `patch_id` and a SHA-256 content hash.
-- `shell=False` command execution with argv, workspace cwd, timeout, output limits, and
-  minimal environment inheritance.
+- `shell=False` command execution with argv, workspace cwd, timeout, streaming output
+  limits, minimal environment inheritance, and bounded process-tree cleanup.
 - Allowlisted `pytest`, `python -m pytest`, and `npm test` command shapes.
 - Success reports with retained workspace and actual diff.
-- Failure and timeout reports with workspace reset and rollback verification.
+- Failure and timeout reports with baseline/final manifest hashes, source-integrity
+  evidence, and rollback verification.
 
 ## Product Boundary
 
@@ -146,7 +148,9 @@ with `from_status` and `to_status`.
 3. `WorkspaceManager` copies the source repository to a task-specific temporary path.
 4. `PatchApplier` validates paths and applies all hunks in memory as a dry run.
 5. Inspect the immutable proposal through `GET /tasks/{task_id}/diff`.
-6. Approve the exact `patch_id`; approval records the proposal content hash.
+6. Approve the exact `patch_id` and return the SHA-256 shown by the diff endpoint as
+   `expected_content_hash`; approval also records the normalized test-command hash and
+   task revision.
 7. Call `POST /tasks/{task_id}/execute`.
 8. The service revalidates approval, applies the patch only in the workspace, and runs
    one allowlisted test command with a timeout.
@@ -156,6 +160,10 @@ with `from_status` and `to_status`.
 
 Patch application and test execution have zero automatic retries in this alpha. The
 repository search Agent Loop remains bounded to at most two retries.
+Repeating `/execute` after that patch already reached `SUCCEEDED` or `FAILED` returns
+the stored task/report and does not run the command again. `CANCELLED` is terminal for
+the rejected patch attempt, although the same task may start a new proposal with a new
+patch ID.
 
 See [Safe Editing](docs/safe-editing.md) for the threat model and exact policy.
 
@@ -180,11 +188,13 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ## Run
 
 ```powershell
-uvicorn repopilot_lite.main:app --reload
+uvicorn repopilot_lite.main:app --host 127.0.0.1 --workers 1
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). The OpenAPI page exposes
 the complete analysis, proposal, approval, execution, result, and log flow.
+v0.3 supports one application process and one Uvicorn worker only. Do not expose this
+unauthenticated teaching API on a public or multi-tenant network.
 
 ## API
 
@@ -197,7 +207,7 @@ the complete analysis, proposal, approval, execution, result, and log flow.
 | `GET` | `/tools` | List registered repository tools |
 | `POST` | `/tasks/{task_id}/patches` | Submit and dry-run validate a patch |
 | `GET` | `/tasks/{task_id}/diff` | Inspect the current patch and approval state |
-| `POST` | `/tasks/{task_id}/approve` | Approve one exact patch ID |
+| `POST` | `/tasks/{task_id}/approve` | Approve one patch ID and reviewed SHA-256 |
 | `POST` | `/tasks/{task_id}/reject` | Reject one exact patch ID |
 | `POST` | `/tasks/{task_id}/execute` | Apply the approved patch and run tests |
 
@@ -248,7 +258,10 @@ $proposal = Invoke-RestMethod -Method Post -Uri "$base/tasks/$taskId/patches" `
     -ContentType "application/json" -Body $patchBody
 $diff = Invoke-RestMethod -Method Get -Uri "$base/tasks/$taskId/diff"
 
-$approvalBody = @{ patch_id = $proposal.id } | ConvertTo-Json
+$approvalBody = @{
+    patch_id = $proposal.id
+    expected_content_hash = $proposal.content_hash
+} | ConvertTo-Json
 $approved = Invoke-RestMethod -Method Post -Uri "$base/tasks/$taskId/approve" `
     -ContentType "application/json" -Body $approvalBody
 
@@ -279,19 +292,30 @@ If the OpenAI-compatible request fails, parsing fails, or the key is absent, the
 summarizer returns the complete result schema. The LLM summarizer does not generate or
 approve patches and cannot select commands.
 
+When enabled, the optional summarizer sends the task question, up to 80 file names, a
+2,000-character README excerpt, and up to 20 search matches to the configured endpoint.
+Do not enable it for repository data that must remain local. API keys are used only in
+the outbound authorization header and are not written to task or command logs.
+
 ## Security Boundary
 
-- Source repositories are only read; editing targets a temporary copied workspace.
+- Harness-managed file operations read the source and write only the copied workspace.
+  Trusted repository tests still run with the API process permissions and can access
+  paths outside cwd; this is not an OS write sandbox.
 - `.git`, virtual environments, dependency folders, caches, and build outputs are not
-  copied; symlinks are skipped.
+  copied. Symlinks, junctions, and other reparse points are rejected rather than
+  followed.
 - Patch paths must be relative POSIX paths with no drive, backslash, absolute prefix,
   `.` or `..`; resolved targets must remain inside the workspace.
 - Patches are UTF-8 text modifications only and are limited to 1,000,000 characters,
   100 files, and 1,000 hunks per file.
-- Approval binds an immutable patch ID and SHA-256 content hash.
+- Approval requires the client-reviewed SHA-256 and binds patch ID, content hash,
+  normalized command hash, and task revision. A changed tuple is invalidated and must
+  be approved again.
 - Test commands use argv and `shell=False`, run with a workspace-contained cwd, and
   reject absolute or parent-traversing path arguments.
-- Command output is truncated and environment values are not persisted in reports.
+- Command output is bounded while streaming; discarded byte counts and process cleanup
+  results are retained without persisting environment values.
 - API keys and sensitive inherited environment variables are excluded from test runs.
 
 This is a safety harness, not an OS sandbox. Repository tests execute repository code
@@ -305,8 +329,11 @@ Runtime records use inspectable JSON files under `data/`:
 - `data/logs.json`
 - `data/patches.json`
 
-The storage uses in-process locking and atomic temporary-file replacement. It is
-appropriate for a single-process demo, not concurrent multi-worker production use.
+The storage uses in-process locking, monotonic task revisions, unique sibling temporary
+files, `flush`/best-effort `fsync`, atomic replacement, and a redo journal for bundled
+task/patch/log commits. Startup reads complete an interrupted journal before returning
+records. It is appropriate for a single-process demo, not concurrent multi-worker or
+distributed production use.
 Task workspaces live under the operating system temporary directory by default.
 
 ## Tests And Quality Checks
@@ -325,9 +352,10 @@ python -m pytest -q -p no:cacheprovider `
 ```
 
 The automated suite covers API compatibility, bounded search retry, LLM fallback,
-state transitions, workspace isolation, traversal rejection, dry-run failure, exact
-approval, successful execution, failed tests, timeout, rollback verification, output
-capture, and Windows-style path rejection.
+state transitions, symlink/reparse rejection, traversal rejection, dry-run failure,
+stale approval, concurrent execute serialization, successful execution, process-tree
+timeout cleanup, rollback content/manifest verification, JSON fault recovery, bounded
+output, and Windows-style path rejection.
 
 ## Project Structure
 
@@ -362,11 +390,20 @@ OpenCode-Lite/
 ## Known Limitations
 
 - Synchronous API execution blocks the request while analysis or tests run.
-- JSON Storage is not safe for multiple Uvicorn workers or distributed execution.
+- JSON Storage and task locks support one application process and one Uvicorn worker;
+  multiple workers or distributed execution are unsupported.
 - Workspace copy cost grows with repository size.
-- Rollback recreates the workspace from the source instead of preserving failed file
-  contents; the submitted patch, logs, test output, and pre-rollback diff remain stored.
-- Test timeout cannot guarantee termination of every descendant process on every OS.
+- Rollback recreates the workspace from the source instead of preserving every failed
+  intermediate byte. Reports retain the patch, bounded test output, apply ledger, and
+  baseline/expected/final/source manifest hashes.
+- Windows commands fail closed unless they can be assigned to a kill-on-close Job
+  Object; POSIX uses a new process group. Code that escapes those OS primitives is
+  outside the v0.3 trusted-repository boundary.
+- A whole application-process crash can leave an in-flight task in a transitional
+  state; the redo journal protects JSON bundles but is not a durable execution
+  supervisor. Inspect and reset such a task workspace before retrying.
+- Logs have no automatic retention or rotation policy in this alpha and may include
+  bounded stdout/stderr, README excerpts, search matches, and local paths.
 - The patch parser intentionally supports a conservative subset of unified diff.
 - Internal imports still use `repopilot_lite` for compatibility during the rename.
 
@@ -378,7 +415,7 @@ Planned directions, not current capabilities:
 - Entrypoint, dependency, and richer safe test-command detection.
 - AST-aware repository indexing and modification planning.
 - Evaluator-style patch review before the human approval gate.
-- Stronger process isolation and descendant-process cleanup.
+- OS sandboxing and a durable execution supervisor for crash recovery.
 - Dynamic planning with strict budgets and policy validation.
 - Optional vector retrieval only after measurable repository-understanding evaluation.
 

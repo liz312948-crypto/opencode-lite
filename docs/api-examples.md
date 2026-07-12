@@ -20,6 +20,9 @@ Content-Type: application/json
 
 `test_command` and `test_timeout_seconds` are optional. Existing v0.2 request bodies
 with only `repo_path` and `question` remain valid.
+The command must be explicitly authorized by the local operator and must match one of
+the documented pytest/npm shapes. Repository tests execute trusted code; cwd and argv
+controls are not an OS sandbox.
 
 ```json
 {
@@ -85,12 +88,23 @@ Content-Type: application/json
 
 ```json
 {
-  "patch_id": "patch-id"
+  "patch_id": "patch-id",
+  "expected_content_hash": "the-64-character-content_hash-from-diff"
 }
 ```
 
-Use the same body with `POST /tasks/{task_id}/reject` to reject it. Repeating approval
-of the same unchanged patch is idempotent. A different or stale ID returns HTTP `409`.
+The caller must return the exact SHA-256 it reviewed. Repeating approval of the same
+unchanged patch, command, and task revision is idempotent. If an already-approved
+context changed, the request returns `409 APPROVAL_STALE`, atomically invalidates the
+old tuple, and requires another explicit approval action.
+
+Rejection uses a separate body without a hash:
+
+```json
+{
+  "patch_id": "patch-id"
+}
+```
 
 ## 6. Execute
 
@@ -101,6 +115,8 @@ POST /tasks/{task_id}/execute
 Unapproved execution returns HTTP `409`. Approved execution returns the complete task.
 Operational test failure is represented by `status: "FAILED"` and a structured
 `execution_report`, matching the behavior of the existing synchronous `/run` API.
+Repeating execute after the same patch reached `SUCCEEDED` or `FAILED` returns its
+stored task/report without starting another command.
 
 Successful report fields:
 
@@ -111,6 +127,10 @@ Successful report fields:
     "modified_files": ["calculator.py"],
     "tests_passed": true,
     "rollback_triggered": false,
+    "source_unchanged": true,
+    "baseline_manifest_hash": "sha256...",
+    "expected_manifest_hash": "sha256...",
+    "final_manifest_hash": "sha256...",
     "final_status": "SUCCEEDED"
   }
 }
@@ -126,6 +146,10 @@ Failure report fields:
     "tests_passed": false,
     "rollback_triggered": true,
     "rollback_succeeded": true,
+    "rollback_error": null,
+    "source_unchanged": true,
+    "attempted_files": ["calculator.py"],
+    "replaced_files": ["calculator.py"],
     "failure_stage": "testing",
     "final_status": "FAILED"
   }
@@ -159,9 +183,11 @@ Safe-editing API errors use an object in FastAPI's `detail` field:
 
 Common HTTP precondition codes include `ANALYSIS_REQUIRED`,
 `PATCH_VALIDATION_FAILED`, `PATCH_ID_MISMATCH`, `PATCH_NOT_APPROVED`,
-`PATCH_CONTENT_CHANGED`, and `COMMAND_POLICY_VIOLATION`. Operational failures after
-execution begins are returned in the task's `error_code`, such as `TESTS_FAILED` and
-`TEST_TIMEOUT`.
+`PATCH_CONTENT_CHANGED`, `APPROVAL_STALE`, `APPROVED_COMMAND_CHANGED`,
+`WORKSPACE_BASELINE_MISMATCH`, `STORAGE_REVISION_CONFLICT`, and
+`COMMAND_POLICY_VIOLATION`. Operational failures after execution begins are returned
+in the task's `error_code`, such as `TESTS_FAILED`, `TEST_TIMEOUT`,
+`PROCESS_CLEANUP_FAILED`, and `WORKSPACE_CHANGED_DURING_TESTS`.
 
 ## Complete PowerShell Flow
 
