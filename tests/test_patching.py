@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from repopilot_lite.patching import PatchApplier, PatchValidationError
+from repopilot_lite.patching import PatchApplier, PatchApplyError, PatchValidationError
 
 VALID_PATCH = """--- a/app.py
 +++ b/app.py
@@ -68,6 +68,54 @@ def test_patch_context_failure_does_not_write(tmp_path: Path) -> None:
         PatchApplier().apply(workspace, invalid_patch)
 
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_multifile_commit_failure_restores_prior_replacements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "first.py"
+    second = workspace / "second.py"
+    first.write_text("VALUE = 1\n", encoding="utf-8")
+    second.write_text("VALUE = 10\n", encoding="utf-8")
+    patch = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-VALUE = 1
++VALUE = 2
+--- a/second.py
++++ b/second.py
+@@ -1 +1 @@
+-VALUE = 10
++VALUE = 20
+"""
+    original_replace = Path.replace
+    committed_temporary_files = 0
+
+    def interrupt_second_commit(source: Path, target: Path) -> Path:
+        nonlocal committed_temporary_files
+        if source.name.endswith(".opencode-lite.tmp"):
+            committed_temporary_files += 1
+            if committed_temporary_files == 2:
+                raise OSError("simulated second-file commit failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", interrupt_second_commit)
+
+    with pytest.raises(PatchApplyError) as captured:
+        PatchApplier().apply(workspace, patch)
+
+    error = captured.value
+    assert error.attempted_files == ["first.py", "second.py"]
+    assert error.replaced_files == ["first.py"]
+    assert error.restored_files == ["first.py"]
+    assert error.restore_errors == []
+    assert first.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert second.read_text(encoding="utf-8") == "VALUE = 10\n"
+    assert not list(workspace.glob("*.opencode-lite.tmp"))
+    assert not list(workspace.glob("*.opencode-lite.backup"))
 
 
 def _write_exact(path: Path, content: str) -> None:
