@@ -206,6 +206,12 @@ class SafeEditingService:
             raise EditingError(409, "PATCH_NOT_VALID", "Only a valid patch can be approved.")
         current_hash = patch_content_hash(patch.unified_diff)
         if patch.content_hash != current_hash:
+            if patch.validation_status == PatchValidationStatus.APPROVED:
+                self._invalidate_approval(
+                    task,
+                    patch,
+                    "Stored patch content no longer matches its immutable digest.",
+                )
             raise EditingError(409, "PATCH_CONTENT_CHANGED", "Patch content hash has changed.")
         if decision.expected_content_hash != current_hash:
             raise EditingError(
@@ -227,14 +233,24 @@ class SafeEditingService:
             raise EditingError(422, exc.error_code, str(exc), patch_id=patch.id) from exc
 
         command_hash = self._command_spec_hash(command_spec)
-        if (
-            patch.validation_status == PatchValidationStatus.APPROVED
-            and task.approved_patch_id == patch.id
-            and patch.approved_hash == current_hash
-            and patch.approved_command_hash == command_hash
-            and patch.approved_task_revision == task.revision
-        ):
-            return patch
+        if patch.validation_status == PatchValidationStatus.APPROVED:
+            if (
+                task.approved_patch_id == patch.id
+                and patch.approved_hash == current_hash
+                and patch.approved_command_hash == command_hash
+                and patch.approved_task_revision == task.revision
+            ):
+                return patch
+            self._invalidate_approval(
+                task,
+                patch,
+                "The approved task revision or command changed after approval.",
+            )
+            raise EditingError(
+                409,
+                "APPROVAL_STALE",
+                "The prior approval is stale; review and approve the current context again.",
+            )
 
         patch.validation_status = PatchValidationStatus.APPROVED
         patch.approved_hash = current_hash
@@ -324,19 +340,36 @@ class SafeEditingService:
 
         patch = self._get_current_patch_locked(task)
         current_hash = patch_content_hash(patch.unified_diff)
-        if (
+        approval_tuple_invalid = (
             patch.validation_status != PatchValidationStatus.APPROVED
             or task.approved_patch_id != patch.id
             or patch.approved_hash != patch.content_hash
             or patch.approved_task_revision != task.revision
-        ):
+        )
+        if approval_tuple_invalid:
+            if (
+                patch.validation_status == PatchValidationStatus.APPROVED
+                or task.approved_patch_id is not None
+                or patch.approved_hash is not None
+                or patch.approved_command_hash is not None
+                or patch.approved_task_revision is not None
+            ):
+                self._invalidate_approval(
+                    task,
+                    patch,
+                    "The persisted approval tuple no longer matches the current task.",
+                )
             raise EditingError(
                 409,
                 "PATCH_NOT_APPROVED",
                 "The task's current patch has not been approved.",
             )
         if patch.content_hash != current_hash:
-            self._invalidate_approval(task, patch)
+            self._invalidate_approval(
+                task,
+                patch,
+                "Approved patch content changed before execution.",
+            )
             raise EditingError(409, "PATCH_CONTENT_CHANGED", "Approved patch content has changed.")
         if task.workspace_path is None or task.source_repo_path is None:
             raise EditingError(409, "WORKSPACE_NOT_FOUND", "Task workspace is not available.")
@@ -362,7 +395,11 @@ class SafeEditingService:
             ) from exc
 
         if patch.approved_command_hash != self._command_spec_hash(command_spec):
-            self._invalidate_approval(task, patch)
+            self._invalidate_approval(
+                task,
+                patch,
+                "The approved command changed before execution.",
+            )
             raise EditingError(
                 409,
                 "APPROVED_COMMAND_CHANGED",
@@ -423,6 +460,15 @@ class SafeEditingService:
                 raise _ExecutionFailure(
                     "TEST_TIMEOUT",
                     f"Test command timed out after {command_spec.timeout_seconds} seconds.",
+                    "testing",
+                )
+            if (
+                command_result.process_tree_terminated is False
+                or command_result.termination_error is not None
+            ):
+                raise _ExecutionFailure(
+                    "PROCESS_CLEANUP_FAILED",
+                    "Test command resources could not be verified as fully cleaned up.",
                     "testing",
                 )
             if command_result.exit_code != 0:
@@ -541,6 +587,17 @@ class SafeEditingService:
         )
         rollback_succeeded = False
         rollback_error: str | None = None
+        cleanup_barrier_error: str | None = None
+        for result in test_results:
+            if (
+                result.process_tree_terminated is False
+                or result.termination_error is not None
+            ):
+                cleanup_barrier_error = (
+                    "Process tree cleanup was not verified; rollback cannot be reported "
+                    "as stable."
+                )
+                break
 
         try:
             if task.source_repo_path is None:
@@ -575,6 +632,13 @@ class SafeEditingService:
                 rollback_error = (
                     f"{rollback_error} {source_error}" if rollback_error else source_error
                 )
+        if cleanup_barrier_error is not None:
+            rollback_succeeded = False
+            rollback_error = (
+                f"{rollback_error} {cleanup_barrier_error}"
+                if rollback_error
+                else cleanup_barrier_error
+            )
 
         rollback_log = StepLog(
             task_id=task.task_id,
@@ -685,14 +749,32 @@ class SafeEditingService:
             raise EditingError(404, "TASK_NOT_FOUND", "Task was not found.")
         return current
 
-    def _invalidate_approval(self, task: TaskRecord, patch: PatchProposal) -> None:
-        patch.validation_status = PatchValidationStatus.VALID
+    def _invalidate_approval(
+        self,
+        task: TaskRecord,
+        patch: PatchProposal,
+        reason: str,
+    ) -> None:
+        invalidation_log = self._log_entry(
+            task,
+            "approval",
+            "INVALIDATED",
+            "Patch approval invalidated.",
+            patch,
+            reason=reason,
+        )
+        if patch.validation_status == PatchValidationStatus.APPROVED:
+            patch.validation_status = PatchValidationStatus.VALID
         patch.approved_hash = None
         patch.approved_command_hash = None
         patch.approved_task_revision = None
         patch.approved_at = None
         task.approved_patch_id = None
-        self.storage.update_task_and_patch(task, patch)
+        self.storage.update_task_and_patch(
+            task,
+            patch,
+            logs_to_add=(invalidation_log,),
+        )
 
     @staticmethod
     def _command_spec_hash(command_spec: CommandSpec) -> str:
@@ -731,11 +813,22 @@ class SafeEditingService:
         status: str,
         message: str,
         patch: PatchProposal,
+        *,
+        reason: str | None = None,
     ) -> StepLog:
+        data: dict[str, Any] = {
+            "patch_id": patch.id,
+            "content_hash": patch.content_hash,
+            "approved_hash": patch.approved_hash,
+            "approved_command_hash": patch.approved_command_hash,
+            "approved_task_revision": patch.approved_task_revision,
+        }
+        if reason is not None:
+            data["reason"] = reason
         return StepLog(
             task_id=task.task_id,
             step=step,
             status=status,
             message=message,
-            data={"patch_id": patch.id, "content_hash": patch.content_hash},
+            data=data,
         )
