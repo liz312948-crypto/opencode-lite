@@ -118,6 +118,36 @@ def test_multifile_commit_failure_restores_prior_replacements(
     assert not list(workspace.glob("*.opencode-lite.backup"))
 
 
+def test_post_replace_verification_failure_restores_and_records_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    patch = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-VALUE = 1
++VALUE = 2
+"""
+    applier = PatchApplier()
+    monkeypatch.setattr(applier, "_read_text", lambda token: "unexpected content")
+
+    with pytest.raises(PatchApplyError) as captured:
+        applier.apply(workspace, patch)
+
+    error = captured.value
+    assert error.attempted_files == ["app.py"]
+    assert error.replaced_files == ["app.py"]
+    assert error.restored_files == ["app.py"]
+    assert error.restore_errors == []
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not list(workspace.glob("*.opencode-lite.tmp"))
+    assert not list(workspace.glob("*.opencode-lite.backup"))
+
+
 def _write_exact(path: Path, content: str) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         handle.write(content)

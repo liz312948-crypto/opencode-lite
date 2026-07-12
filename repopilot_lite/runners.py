@@ -442,6 +442,11 @@ class CommandRunner:
                     if not cleanup_succeeded:
                         process_tree_terminated = False
                         termination_error = termination_error or cleanup_error
+                elif os.name != "nt" and not timed_out:
+                    cleanup_succeeded, cleanup_error = self._terminate_posix_group(process)
+                    if not cleanup_succeeded:
+                        process_tree_terminated = False
+                        termination_error = termination_error or cleanup_error
                 for thread in reader_threads:
                     thread.join(timeout=self.cleanup_grace_seconds)
                 alive_threads = [thread for thread in reader_threads if thread.is_alive()]

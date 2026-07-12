@@ -116,6 +116,43 @@ def test_command_runner_timeout_terminates_descendant_processes(tmp_path: Path) 
     assert not sentinel.exists()
 
 
+def test_command_runner_cleans_descendants_after_root_success(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ready = workspace / "background-ready.txt"
+    sentinel = workspace / "background-survived.txt"
+    child_code = (
+        "import pathlib, time; "
+        f"pathlib.Path({str(ready)!r}).write_text('ready', encoding='utf-8'); "
+        "time.sleep(1.0); "
+        f"pathlib.Path({str(sentinel)!r}).write_text('alive', encoding='utf-8')"
+    )
+    parent_code = (
+        "import pathlib, subprocess, sys, time; "
+        f"ready = pathlib.Path({str(ready)!r}); "
+        f"subprocess.Popen([sys.executable, '-c', {json.dumps(child_code)}], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "deadline = time.time() + 2; "
+        "exec(\"while not ready.exists() and time.time() < deadline:\\n "
+        "   time.sleep(0.01)\"); "
+        "sys.exit(0 if ready.exists() else 2)"
+    )
+    spec = CommandSpec(
+        argv=[sys.executable, "-c", parent_code],
+        cwd=str(workspace),
+        timeout_seconds=5,
+    )
+
+    result = CommandRunner(workspace).run(spec)
+    time.sleep(1.2)
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.termination_error is None
+    assert ready.read_text(encoding="utf-8") == "ready"
+    assert not sentinel.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object policy")
 def test_command_runner_fails_closed_when_job_setup_is_unavailable(
     tmp_path: Path,

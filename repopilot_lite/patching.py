@@ -193,12 +193,12 @@ class PatchApplier:
                         f"Patch target changed before commit: {change.path}"
                     )
                 temporary.replace(current.path)
+                replaced.append((change, backup))
                 committed = validate_regular_file(workspace, change.path)
                 if self._read_text(committed) != change.new_content:
                     raise PatchValidationError(
                         f"Patch target did not match prepared content: {change.path}"
                     )
-                replaced.append((change, backup))
         except Exception as exc:
             for change, backup in reversed(replaced):
                 try:
