@@ -123,12 +123,14 @@ directory or a `package.json` with a test script. The LLM never selects a comman
 
 ## Rollback
 
-Before patch application, the service captures full source/workspace manifests and
-requires them to match. After apply it captures the approved expected manifest. A
-non-zero exit, timeout, cleanup problem, exception, or post-test manifest drift moves
-the task to `ROLLING_BACK`. The manager deletes the validated task workspace, recopies
-the source repository, and compares it with the execution baseline; the source
-before/after manifests must also match.
+Before patch application, the service captures a full workspace manifest and a source
+manifest using the documented copy exclusions, and requires them to match. After apply
+it captures the full approved workspace manifest. After passing tests, cache/build
+artifacts are removed with no-follow cleanup; a new full workspace manifest must equal
+the approved result. A non-zero exit, timeout, cleanup problem, exception, or remaining
+post-test drift moves the task to `ROLLING_BACK`. The manager deletes the validated
+workspace, recopies the source, and compares it with the execution baseline; the
+copy-policy source before/after manifests must also match.
 
 The final `ExecutionReport` retains:
 
@@ -138,6 +140,7 @@ The final `ExecutionReport` retains:
 - Exit code or timeout state.
 - Failure stage and structured task error.
 - Baseline, expected, final, and source before/after manifest hashes.
+- Cache/build artifact paths removed before a successful final integrity comparison.
 - Whether rollback ran, whether it matches the execution baseline, and whether the
   source stayed unchanged.
 
@@ -176,3 +179,5 @@ supervisor.
 - The conservative patch subset does not cover every valid output from `git diff`.
 - Logs have no rotation/retention policy and may include bounded user file excerpts,
   search matches, local paths, and command output.
+- `source_unchanged` covers the source entries eligible for workspace copying; ignored
+  `.git`, dependency, cache, and build trees are outside that report field.

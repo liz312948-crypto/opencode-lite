@@ -131,8 +131,9 @@ multi-process transaction or lease model; v0.3 must run with one Uvicorn worker.
    normalized command hash, and task revision.
 4. Every command uses argv, `shell=False`, a timeout, workspace-contained cwd, bounded
    streaming output, and a POSIX process group or Windows Job Object.
-5. `SUCCEEDED` requires the post-test workspace manifest to equal the approved
-   post-patch manifest and the source before/after manifests to match.
+5. `SUCCEEDED` requires safe removal of ignored cache/build artifacts, then a full
+   post-test workspace manifest equal to the approved post-patch manifest; source
+   before/after comparison uses the documented copy policy.
 6. `rollback_succeeded=true` requires the restored manifest to equal the execution
    baseline, the source to remain unchanged, and process cleanup evidence not to fail.
 7. Task/patch/report/status/log bundles are redo-journal recoverable; whole-process

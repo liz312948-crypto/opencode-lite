@@ -55,6 +55,8 @@ All notable changes to this project are documented in this file.
   limits, a timeout, and bounded process-tree termination.
 - Failure, timeout, post-test workspace drift, or cleanup uncertainty trigger workspace
   recreation; rollback success requires baseline/source manifests and cleanup evidence.
+- Passing tests have ignored cache/build artifacts removed before a full workspace
+  manifest is compared with the approved post-patch result.
 
 ## v0.2.0
 

@@ -128,6 +128,7 @@ Successful report fields:
     "tests_passed": true,
     "rollback_triggered": false,
     "source_unchanged": true,
+    "removed_ignored_artifacts": ["tests/__pycache__"],
     "baseline_manifest_hash": "sha256...",
     "expected_manifest_hash": "sha256...",
     "final_manifest_hash": "sha256...",
@@ -135,6 +136,9 @@ Successful report fields:
   }
 }
 ```
+
+`source_unchanged` compares source entries eligible for workspace copying; excluded
+`.git`, dependency, cache, and build trees are not a full-source attestation.
 
 Failure report fields:
 

@@ -317,6 +317,8 @@ the outbound authorization header and are not written to task or command logs.
 - Command output is bounded while streaming; discarded byte counts and process cleanup
   results are retained without persisting environment values.
 - API keys and sensitive inherited environment variables are excluded from test runs.
+- Before a successful result is retained, generated cache/build entries are removed and
+  a no-ignore workspace manifest must equal the approved post-patch manifest.
 
 This is a safety harness, not an OS sandbox. Repository tests execute repository code
 with the permissions of the API process. Run only repositories you trust.
@@ -396,6 +398,9 @@ OpenCode-Lite/
 - Rollback recreates the workspace from the source instead of preserving every failed
   intermediate byte. Reports retain the patch, bounded test output, apply ledger, and
   baseline/expected/final/source manifest hashes.
+- Source before/after hashes intentionally use the same copy policy that excludes
+  `.git`, dependency, cache, and build trees; `source_unchanged` is not a full-disk
+  attestation for trusted test code that writes outside its cwd.
 - Windows commands fail closed unless they can be assigned to a kill-on-close Job
   Object; POSIX uses a new process group. Code that escapes those OS primitives is
   outside the v0.3 trusted-repository boundary.
