@@ -12,6 +12,7 @@ from repopilot_lite.models import (
     PatchValidationStatus,
     StepLog,
     TaskRecord,
+    TaskStatus,
 )
 from repopilot_lite.storage import Storage, StorageConflict
 
@@ -105,6 +106,8 @@ def test_failed_atomic_replace_preserves_previous_valid_json(
     task = _task()
     storage.create_task(task)
     before = storage.tasks_file.read_bytes()
+    original_revision = task.revision
+    original_updated_at = task.updated_at
 
     def fail_replace(source: Path, destination: Path) -> None:
         raise OSError(f"replace failed for {source} -> {destination}")
@@ -116,8 +119,49 @@ def test_failed_atomic_replace_preserves_previous_valid_json(
             storage.update_task(task)
 
     assert storage.tasks_file.read_bytes() == before
+    assert task.revision == original_revision
+    assert task.updated_at == original_updated_at
     assert isinstance(json.loads(storage.tasks_file.read_text(encoding="utf-8")), dict)
     assert not list(storage.data_dir.glob(".tasks.json.*.tmp"))
+
+
+def test_failed_transition_does_not_mutate_caller_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = Storage(tmp_path / "data")
+    task = _task()
+    storage.create_task(task)
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError(f"replace failed for {source} -> {destination}")
+
+    with monkeypatch.context() as context:
+        context.setattr("repopilot_lite.storage.os.replace", fail_replace)
+        with pytest.raises(OSError, match="replace failed"):
+            storage.transition_status(task, TaskStatus.PLANNING)
+
+    assert task.status == TaskStatus.PENDING
+    assert task.revision == 0
+    persisted = storage.get_task(task.task_id)
+    assert persisted is not None
+    assert persisted.status == TaskStatus.PENDING
+    assert persisted.revision == 0
+
+
+def test_plain_task_update_cannot_bypass_state_machine(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "data")
+    storage.create_task(_task())
+    changed = storage.get_task("task-1")
+    assert changed is not None
+    changed.status = TaskStatus.TESTING
+
+    with pytest.raises(StorageConflict, match="transition_status"):
+        storage.update_task(changed)
+
+    persisted = storage.get_task("task-1")
+    assert persisted is not None
+    assert persisted.status == TaskStatus.PENDING
 
 
 def test_incomplete_bundle_is_completed_from_journal_on_restart(
@@ -140,6 +184,8 @@ def test_incomplete_bundle_is_completed_from_journal_on_restart(
         message="commit all records",
     )
     original_write = storage._write_json_atomic
+    original_task_revision = task.revision
+    original_patch_updated_at = patch.updated_at
 
     def interrupt_patch_write(path: Path, value: object) -> None:
         if path == storage.patches_file:
@@ -150,6 +196,8 @@ def test_incomplete_bundle_is_completed_from_journal_on_restart(
     with pytest.raises(OSError, match="simulated interruption"):
         storage.update_task_and_patch(task, patch, logs_to_add=(audit_log,))
     assert storage.journal_file.exists()
+    assert task.revision == original_task_revision
+    assert patch.updated_at == original_patch_updated_at
 
     recovered = Storage(data_dir)
 

@@ -81,8 +81,9 @@ class Storage:
         with self._lock:
             self._recover_journal()
             tasks = self._read_json(self.tasks_file)
-            self._prepare_task_update(tasks, task)
+            candidate = self._prepare_task_update(tasks, task)
             self._write_json(self.tasks_file, tasks)
+            self._sync_task(task, candidate)
         return task
 
     def transition_status(
@@ -111,27 +112,32 @@ class Storage:
                 patches = self._read_json(self.patches_file)
                 self._assert_patch_update(patches, patch)
             previous = task.status
-            transition_task(task, status)
+            transitioned = task.model_copy(deep=True)
+            transition_task(transitioned, status)
 
             if status == TaskStatus.FAILED:
-                task.error_code = error_code or "TASK_FAILED"
-                task.error_message = error_message or "Task execution failed."
-                task.error = task.error_message
+                transitioned.error_code = error_code or "TASK_FAILED"
+                transitioned.error_message = error_message or "Task execution failed."
+                transitioned.error = transitioned.error_message
             else:
-                task.error_code = None
-                task.error_message = None
-                task.error = None
+                transitioned.error_code = None
+                transitioned.error_message = None
+                transitioned.error = None
 
-            self._prepare_task_update(tasks, task, revision_checked=True)
+            task_candidate = self._prepare_task_update(
+                tasks,
+                transitioned,
+                revision_checked=True,
+            )
             transition_log = StepLog(
-                task_id=task.task_id,
+                task_id=task_candidate.task_id,
                 step="state",
                 status="TRANSITION",
                 message=message or f"Task transitioned from {previous} to {status}.",
                 data={
                     "from_status": previous.value,
                     "to_status": status.value,
-                    "error_code": task.error_code,
+                    "error_code": task_candidate.error_code,
                 },
             )
             for item in (*bundled_logs, transition_log):
@@ -141,10 +147,18 @@ class Storage:
                 self.tasks_file: tasks,
                 self.logs_file: logs,
             }
+            patch_candidate: PatchProposal | None = None
             if patch is not None and patches is not None:
-                self._prepare_patch_update(patches, patch, validated=True)
+                patch_candidate = self._prepare_patch_update(
+                    patches,
+                    patch,
+                    validated=True,
+                )
                 updates[self.patches_file] = patches
             self._write_many(updates)
+            self._sync_task(task, task_candidate)
+            if patch is not None and patch_candidate is not None:
+                self._sync_patch(patch, patch_candidate)
         return task
 
     def update_status(
@@ -192,14 +206,19 @@ class Storage:
                 raise StorageConflict(f"Patch already exists: {patch.id}")
 
             previous = task.status
-            transition_task(task, status)
-            task.error = None
-            task.error_code = None
-            task.error_message = None
-            self._prepare_task_update(tasks, task, revision_checked=True)
+            transitioned = task.model_copy(deep=True)
+            transition_task(transitioned, status)
+            transitioned.error = None
+            transitioned.error_code = None
+            transitioned.error_message = None
+            task_candidate = self._prepare_task_update(
+                tasks,
+                transitioned,
+                revision_checked=True,
+            )
             patches[patch.id] = patch.model_dump(mode="json")
             transition_log = StepLog(
-                task_id=task.task_id,
+                task_id=task_candidate.task_id,
                 step="state",
                 status="TRANSITION",
                 message=message or f"Task transitioned from {previous} to {status}.",
@@ -209,7 +228,7 @@ class Storage:
                     "error_code": None,
                 },
             )
-            logs.setdefault(task.task_id, []).append(
+            logs.setdefault(task_candidate.task_id, []).append(
                 transition_log.model_dump(mode="json")
             )
             self._write_many(
@@ -219,6 +238,7 @@ class Storage:
                     self.logs_file: logs,
                 }
             )
+            self._sync_task(task, task_candidate)
         return task, patch
 
     def get_patch(self, patch_id: str) -> PatchProposal | None:
@@ -234,8 +254,9 @@ class Storage:
         with self._lock:
             self._recover_journal()
             patches = self._read_json(self.patches_file)
-            self._prepare_patch_update(patches, patch)
+            candidate = self._prepare_patch_update(patches, patch)
             self._write_json(self.patches_file, patches)
+            self._sync_patch(patch, candidate)
         return patch
 
     def update_task_and_patch(
@@ -247,17 +268,22 @@ class Storage:
     ) -> tuple[TaskRecord, PatchProposal]:
         if patch.task_id != task.task_id:
             raise StorageConflict("Patch does not belong to the updated task.")
+        bundled_logs = tuple(logs_to_add)
+        if any(item.task_id != task.task_id for item in bundled_logs):
+            raise StorageConflict("Log does not belong to the updated task.")
         with self._lock:
             self._recover_journal()
             tasks = self._read_json(self.tasks_file)
             patches = self._read_json(self.patches_file)
             logs = self._read_json(self.logs_file)
             self._assert_patch_update(patches, patch)
-            self._prepare_task_update(tasks, task)
-            self._prepare_patch_update(patches, patch, validated=True)
-            for item in logs_to_add:
-                if item.task_id != task.task_id:
-                    raise StorageConflict("Log does not belong to the updated task.")
+            task_candidate = self._prepare_task_update(tasks, task)
+            patch_candidate = self._prepare_patch_update(
+                patches,
+                patch,
+                validated=True,
+            )
+            for item in bundled_logs:
                 logs.setdefault(item.task_id, []).append(item.model_dump(mode="json"))
             self._write_many(
                 {
@@ -266,6 +292,8 @@ class Storage:
                     self.logs_file: logs,
                 }
             )
+            self._sync_task(task, task_candidate)
+            self._sync_patch(patch, patch_candidate)
         return task, patch
 
     def get_task_patches(self, task_id: str) -> list[PatchProposal]:
@@ -325,6 +353,10 @@ class Storage:
                 f"Task {task.task_id} has revision {persisted.revision}; "
                 f"received stale revision {task.revision}."
             )
+        if task.status != persisted.status:
+            raise StorageConflict(
+                "Task status changes must use the transition_status storage operation."
+            )
 
     def _prepare_task_update(
         self,
@@ -332,12 +364,14 @@ class Storage:
         task: TaskRecord,
         *,
         revision_checked: bool = False,
-    ) -> None:
+    ) -> TaskRecord:
         if not revision_checked:
             self._assert_task_revision(tasks, task)
-        task.revision += 1
-        task.updated_at = datetime.now(UTC)
-        tasks[task.task_id] = task.model_dump(mode="json")
+        candidate = task.model_copy(deep=True)
+        candidate.revision += 1
+        candidate.updated_at = datetime.now(UTC)
+        tasks[candidate.task_id] = candidate.model_dump(mode="json")
+        return candidate
 
     @staticmethod
     def _assert_patch_update(
@@ -379,11 +413,25 @@ class Storage:
         patch: PatchProposal,
         *,
         validated: bool = False,
-    ) -> None:
+    ) -> PatchProposal:
         if not validated:
             self._assert_patch_update(patches, patch)
-        patch.updated_at = datetime.now(UTC)
-        patches[patch.id] = patch.model_dump(mode="json")
+        candidate = patch.model_copy(deep=True)
+        candidate.updated_at = datetime.now(UTC)
+        patches[candidate.id] = candidate.model_dump(mode="json")
+        return candidate
+
+    @staticmethod
+    def _sync_task(target: TaskRecord, source: TaskRecord) -> None:
+        snapshot = source.model_copy(deep=True)
+        for name in TaskRecord.model_fields:
+            setattr(target, name, getattr(snapshot, name))
+
+    @staticmethod
+    def _sync_patch(target: PatchProposal, source: PatchProposal) -> None:
+        snapshot = source.model_copy(deep=True)
+        for name in PatchProposal.model_fields:
+            setattr(target, name, getattr(snapshot, name))
 
     def _write_many(self, updates: dict[Path, object]) -> None:
         if not updates:
