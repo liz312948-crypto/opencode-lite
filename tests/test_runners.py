@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import repopilot_lite.runners as runners_module
 from repopilot_lite.models import CommandSpec
 from repopilot_lite.runners import (
     CommandPolicyError,
@@ -144,6 +145,63 @@ def test_command_runner_fails_closed_when_job_setup_is_unavailable(
     assert result.timed_out is False
     assert "Job setup unavailable" in result.stderr
     assert not marker.exists()
+
+
+def test_posix_cleanup_escalates_when_parent_exits_before_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    group_active = True
+    sent_signals: list[int] = []
+    clock = 0.0
+
+    class FakeProcess:
+        pid = 321
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            assert self.returncode is not None
+            return self.returncode
+
+    process = FakeProcess()
+
+    def fake_kill_group(process_id: int, requested_signal: int) -> None:
+        nonlocal group_active
+        assert process_id == process.pid
+        if requested_signal == 0:
+            if group_active:
+                return
+            raise ProcessLookupError
+        sent_signals.append(requested_signal)
+        if requested_signal == runners_module.signal.SIGTERM:
+            process.returncode = -requested_signal
+        else:
+            group_active = False
+
+    def fake_clock() -> float:
+        nonlocal clock
+        clock += 0.6
+        return clock
+
+    monkeypatch.setattr(runners_module.os, "killpg", fake_kill_group, raising=False)
+    monkeypatch.setattr(runners_module.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(runners_module, "perf_counter", fake_clock)
+    monkeypatch.setattr(runners_module, "sleep", lambda seconds: None)
+
+    succeeded, error = CommandRunner(workspace)._terminate_posix_group(process)  # type: ignore[arg-type]
+
+    assert succeeded is True
+    assert error is None
+    assert sent_signals == [
+        runners_module.signal.SIGTERM,
+        getattr(runners_module.signal, "SIGKILL", runners_module.signal.SIGTERM),
+    ]
 
 
 def test_test_runner_rejects_arbitrary_python(tmp_path: Path) -> None:

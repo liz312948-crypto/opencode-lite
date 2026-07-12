@@ -539,20 +539,61 @@ class CommandRunner:
             return False, "POSIX process-group termination is unavailable."
         try:
             kill_group(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         except OSError as exc:
             errors.append(f"SIGTERM failed: {exc}")
-        try:
-            process.wait(timeout=min(1.0, self.cleanup_grace_seconds))
-        except subprocess.TimeoutExpired:
+
+        soft_deadline = perf_counter() + min(1.0, self.cleanup_grace_seconds)
+        group_exited, wait_error = self._wait_for_posix_group_exit(
+            process,
+            soft_deadline,
+        )
+        if wait_error:
+            errors.append(wait_error)
+        if not group_exited:
             try:
                 kill_group(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except ProcessLookupError:
+                pass
             except OSError as exc:
                 errors.append(f"SIGKILL failed: {exc}")
-            try:
-                process.wait(timeout=self.cleanup_grace_seconds)
-            except subprocess.TimeoutExpired:
+            hard_deadline = perf_counter() + self.cleanup_grace_seconds
+            group_exited, wait_error = self._wait_for_posix_group_exit(
+                process,
+                hard_deadline,
+            )
+            if wait_error:
+                errors.append(wait_error)
+            if not group_exited:
                 errors.append("Process group did not exit before cleanup deadline.")
-        return process.poll() is not None and not errors, "; ".join(errors) or None
+        return group_exited and process.poll() is not None and not errors, (
+            "; ".join(errors) or None
+        )
+
+    @staticmethod
+    def _wait_for_posix_group_exit(
+        process: subprocess.Popen[bytes],
+        deadline: float,
+    ) -> tuple[bool, str | None]:
+        kill_group = getattr(os, "killpg", None)
+        if kill_group is None:
+            return False, "POSIX process-group inspection is unavailable."
+        while True:
+            process.poll()
+            try:
+                kill_group(process.pid, 0)
+            except ProcessLookupError:
+                try:
+                    process.wait(timeout=max(0.05, deadline - perf_counter()))
+                except subprocess.TimeoutExpired:
+                    return False, "Root process did not exit before cleanup deadline."
+                return True, None
+            except OSError as exc:
+                return False, f"Process-group inspection failed: {exc}"
+            if perf_counter() >= deadline:
+                return False, None
+            sleep(0.02)
 
     def _kill_root_and_wait(
         self,
