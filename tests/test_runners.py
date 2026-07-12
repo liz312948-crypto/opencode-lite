@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from repopilot_lite.models import CommandSpec
-from repopilot_lite.runners import CommandPolicyError, CommandRunner, TestRunner
+from repopilot_lite.runners import (
+    CommandPolicyError,
+    CommandRunner,
+    TestRunner,
+    _WindowsJob,
+)
 
 
 def test_command_runner_captures_stdout_and_stderr(tmp_path: Path) -> None:
@@ -72,6 +80,70 @@ def test_command_runner_truncates_large_output(tmp_path: Path) -> None:
 
     assert result.output_truncated is True
     assert len(result.stdout) <= 80
+    assert result.stdout_bytes_discarded > 0
+
+
+def test_command_runner_timeout_terminates_descendant_processes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ready = workspace / "descendant-ready.txt"
+    sentinel = workspace / "descendant-survived.txt"
+    child_code = (
+        "import pathlib, time; "
+        f"pathlib.Path({str(ready)!r}).write_text('ready', encoding='utf-8'); "
+        "time.sleep(1.5); "
+        f"pathlib.Path({str(sentinel)!r}).write_text('alive', encoding='utf-8')"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {json.dumps(child_code)}]); "
+        "time.sleep(10)"
+    )
+    spec = CommandSpec(
+        argv=[sys.executable, "-c", parent_code],
+        cwd=str(workspace),
+        timeout_seconds=1,
+    )
+
+    result = CommandRunner(workspace).run(spec)
+    time.sleep(1.0)
+
+    assert result.timed_out is True
+    assert result.process_tree_terminated is True, result.termination_error
+    assert result.termination_error is None
+    assert ready.read_text(encoding="utf-8") == "ready"
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object policy")
+def test_command_runner_fails_closed_when_job_setup_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "command-ran.txt"
+    monkeypatch.setattr(
+        _WindowsJob,
+        "create",
+        classmethod(lambda cls: (None, "Job setup unavailable.")),
+    )
+    spec = CommandSpec(
+        argv=[
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+        ],
+        cwd=str(workspace),
+        timeout_seconds=5,
+    )
+
+    result = CommandRunner(workspace).run(spec)
+
+    assert result.exit_code is None
+    assert result.timed_out is False
+    assert "Job setup unavailable" in result.stderr
+    assert not marker.exists()
 
 
 def test_test_runner_rejects_arbitrary_python(tmp_path: Path) -> None:
@@ -82,6 +154,20 @@ def test_test_runner_rejects_arbitrary_python(tmp_path: Path) -> None:
         TestRunner().select_command(
             workspace,
             [sys.executable, "-c", "print('not allowed')"],
+            5,
+        )
+
+
+def test_test_runner_rejects_untrusted_python_executable_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_python = workspace / ("python.exe" if os.name == "nt" else "python")
+    fake_python.write_text("not the configured interpreter", encoding="utf-8")
+
+    with pytest.raises(CommandPolicyError, match="configured Python interpreter"):
+        TestRunner().select_command(
+            workspace,
+            [str(fake_python), "-m", "pytest", "-q"],
             5,
         )
 

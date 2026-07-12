@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import json
 import os
 import re
@@ -11,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from threading import Thread
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import BinaryIO
 
 from repopilot_lite.filesystem_safety import (
@@ -70,6 +72,262 @@ class _BoundedCapture:
             self.error = str(exc)
 
 
+@dataclass
+class _WindowsJob:
+    """Best-effort Windows Job Object that kills all assigned processes on close."""
+
+    handle: int
+    closed: bool = False
+
+    @classmethod
+    def create(cls) -> tuple[_WindowsJob | None, str | None]:
+        if os.name != "nt":
+            return None, None
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return None, "Windows Job Objects are unavailable."
+        kernel32 = loader("kernel32", use_last_error=True)
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.wintypes.DWORD),
+                ("SchedulingClass", ctypes.wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        create_job.restype = ctypes.wintypes.HANDLE
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+        ]
+        set_information.restype = ctypes.wintypes.BOOL
+        handle = create_job(None, None)
+        if not handle:
+            return None, cls._last_error("CreateJobObjectW failed")
+
+        information = _ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not set_information(
+            handle,
+            9,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = cls._last_error("SetInformationJobObject failed")
+            cls._close_handle(int(handle))
+            return None, error
+        return cls(handle=int(handle)), None
+
+    def assign_suspended(self, process: subprocess.Popen[bytes]) -> str | None:
+        loader = getattr(ctypes, "WinDLL", None)
+        process_handle = getattr(process, "_handle", None)
+        if loader is None or process_handle is None:
+            return "Windows process handle is unavailable."
+        kernel32 = loader("kernel32", use_last_error=True)
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE]
+        assign_process.restype = ctypes.wintypes.BOOL
+        if not assign_process(
+            ctypes.wintypes.HANDLE(self.handle),
+            ctypes.wintypes.HANDLE(int(process_handle)),
+        ):
+            return self._last_error("AssignProcessToJobObject failed")
+        return self._resume_primary_thread(process.pid)
+
+    def terminate_and_wait(
+        self,
+        process: subprocess.Popen[bytes],
+        timeout_seconds: float,
+    ) -> tuple[bool, str | None]:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return False, "TerminateJobObject is unavailable."
+        kernel32 = loader("kernel32", use_last_error=True)
+        terminate_job = kernel32.TerminateJobObject
+        terminate_job.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.UINT]
+        terminate_job.restype = ctypes.wintypes.BOOL
+        if not terminate_job(ctypes.wintypes.HANDLE(self.handle), 1):
+            return False, self._last_error("TerminateJobObject failed")
+
+        deadline = perf_counter() + timeout_seconds
+        while perf_counter() < deadline:
+            active_processes, query_error = self._active_process_count()
+            if query_error is not None:
+                return False, query_error
+            if active_processes == 0:
+                try:
+                    process.wait(timeout=max(0.05, deadline - perf_counter()))
+                except subprocess.TimeoutExpired:
+                    return False, "Root process did not exit after Job termination."
+                return True, None
+            sleep(0.02)
+        return False, "Windows Job still contained active processes at cleanup deadline."
+
+    def _active_process_count(self) -> tuple[int | None, str | None]:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return None, "QueryInformationJobObject is unavailable."
+        kernel32 = loader("kernel32", use_last_error=True)
+
+        class _BasicAccountingInformation(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", ctypes.wintypes.DWORD),
+                ("TotalProcesses", ctypes.wintypes.DWORD),
+                ("ActiveProcesses", ctypes.wintypes.DWORD),
+                ("TotalTerminatedProcesses", ctypes.wintypes.DWORD),
+            ]
+
+        query_job = kernel32.QueryInformationJobObject
+        query_job.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        query_job.restype = ctypes.wintypes.BOOL
+        information = _BasicAccountingInformation()
+        if not query_job(
+            ctypes.wintypes.HANDLE(self.handle),
+            1,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            None,
+        ):
+            return None, self._last_error("QueryInformationJobObject failed")
+        return int(information.ActiveProcesses), None
+
+    @classmethod
+    def _resume_primary_thread(cls, process_id: int) -> str | None:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return "Windows thread APIs are unavailable."
+        kernel32 = loader("kernel32", use_last_error=True)
+
+        class _ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.wintypes.DWORD),
+                ("cntUsage", ctypes.wintypes.DWORD),
+                ("th32ThreadID", ctypes.wintypes.DWORD),
+                ("th32OwnerProcessID", ctypes.wintypes.DWORD),
+                ("tpBasePri", ctypes.wintypes.LONG),
+                ("tpDeltaPri", ctypes.wintypes.LONG),
+                ("dwFlags", ctypes.wintypes.DWORD),
+            ]
+
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD]
+        create_snapshot.restype = ctypes.wintypes.HANDLE
+        thread_first = kernel32.Thread32First
+        thread_first.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.POINTER(_ThreadEntry32),
+        ]
+        thread_first.restype = ctypes.wintypes.BOOL
+        thread_next = kernel32.Thread32Next
+        thread_next.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.POINTER(_ThreadEntry32),
+        ]
+        thread_next.restype = ctypes.wintypes.BOOL
+        open_thread = kernel32.OpenThread
+        open_thread.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        ]
+        open_thread.restype = ctypes.wintypes.HANDLE
+        resume_thread = kernel32.ResumeThread
+        resume_thread.argtypes = [ctypes.wintypes.HANDLE]
+        resume_thread.restype = ctypes.wintypes.DWORD
+
+        snapshot = create_snapshot(0x00000004, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if int(snapshot) == invalid_handle:
+            return cls._last_error("CreateToolhelp32Snapshot failed")
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            found_thread_id: int | None = None
+            has_entry = bool(thread_first(snapshot, ctypes.byref(entry)))
+            while has_entry:
+                if int(entry.th32OwnerProcessID) == process_id:
+                    found_thread_id = int(entry.th32ThreadID)
+                    break
+                has_entry = bool(thread_next(snapshot, ctypes.byref(entry)))
+            if found_thread_id is None:
+                return "Suspended process primary thread could not be found."
+        finally:
+            cls._close_handle(int(snapshot))
+
+        thread_handle = open_thread(0x0002, False, found_thread_id)
+        if not thread_handle:
+            return cls._last_error("OpenThread failed")
+        try:
+            if int(resume_thread(thread_handle)) == 0xFFFFFFFF:
+                return cls._last_error("ResumeThread failed")
+        finally:
+            cls._close_handle(int(thread_handle))
+        return None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self._close_handle(self.handle)
+        self.closed = True
+
+    @staticmethod
+    def _close_handle(handle: int) -> None:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return
+        kernel32 = loader("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.wintypes.HANDLE]
+        close_handle.restype = ctypes.wintypes.BOOL
+        close_handle(ctypes.wintypes.HANDLE(handle))
+
+    @staticmethod
+    def _last_error(operation: str) -> str:
+        get_last_error = getattr(ctypes, "get_last_error", lambda: 0)
+        return f"{operation} (Windows error {get_last_error()})."
+
+
 class CommandRunner:
     """Runs one argv command with bounded output, time, cwd, and environment."""
 
@@ -101,8 +359,18 @@ class CommandRunner:
         termination_error: str | None = None
         process: subprocess.Popen[bytes] | None = None
         reader_threads: list[Thread] = []
+        windows_job: _WindowsJob | None = None
+        windows_job_terminated = False
 
         try:
+            windows_job, windows_job_error = _WindowsJob.create()
+            if os.name == "nt" and windows_job is None:
+                raise OSError(windows_job_error or "Windows Job Object setup failed.")
+            creation_flags = 0
+            if os.name == "nt":
+                creation_flags = int(
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ) | int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
             process = subprocess.Popen(
                 spec.argv,
                 cwd=str(cwd),
@@ -112,12 +380,16 @@ class CommandRunner:
                 stderr=subprocess.PIPE,
                 shell=False,
                 start_new_session=os.name != "nt",
-                creationflags=(
-                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-                    if os.name == "nt"
-                    else 0
-                ),
+                creationflags=creation_flags,
             )
+            if windows_job is not None:
+                assignment_error = windows_job.assign_suspended(process)
+                if assignment_error is not None:
+                    cleanup_error = self._kill_root_and_wait(process)
+                    detail = (
+                        f"{assignment_error} {cleanup_error or ''}".strip()
+                    )
+                    raise OSError(detail)
             assert process.stdout is not None
             assert process.stderr is not None
             reader_threads = [
@@ -140,7 +412,18 @@ class CommandRunner:
                 exit_code = process.wait(timeout=spec.timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                process_tree_terminated, termination_error = self._terminate_process_tree(process)
+                if windows_job is not None:
+                    process_tree_terminated, termination_error = (
+                        windows_job.terminate_and_wait(
+                            process,
+                            self.cleanup_grace_seconds,
+                        )
+                    )
+                    windows_job_terminated = True
+                else:
+                    process_tree_terminated, termination_error = (
+                        self._terminate_process_tree(process)
+                    )
                 exit_code = None
         except subprocess.TimeoutExpired as exc:
             timed_out = True
@@ -151,6 +434,14 @@ class CommandRunner:
             stderr_capture.discarded += max(0, len(message) - self.max_output_bytes)
         finally:
             if process is not None:
+                if windows_job is not None and not windows_job_terminated:
+                    cleanup_succeeded, cleanup_error = windows_job.terminate_and_wait(
+                        process,
+                        self.cleanup_grace_seconds,
+                    )
+                    if not cleanup_succeeded:
+                        process_tree_terminated = False
+                        termination_error = termination_error or cleanup_error
                 for thread in reader_threads:
                     thread.join(timeout=self.cleanup_grace_seconds)
                 alive_threads = [thread for thread in reader_threads if thread.is_alive()]
@@ -163,6 +454,8 @@ class CommandRunner:
                     if any(thread.is_alive() for thread in alive_threads):
                         process_tree_terminated = False
                         termination_error = termination_error or "Output pipes did not close."
+            if windows_job is not None:
+                windows_job.close()
 
         stdout = stdout_capture.content.decode("utf-8", errors="replace")
         stderr = stderr_capture.content.decode("utf-8", errors="replace")
@@ -232,10 +525,8 @@ class CommandRunner:
         self,
         process: subprocess.Popen[bytes],
     ) -> tuple[bool, str | None]:
-        if process.poll() is not None:
-            return True, None
         if os.name == "nt":
-            return self._terminate_windows_tree(process)
+            return False, "Windows process cleanup requires an assigned Job Object."
         return self._terminate_posix_group(process)
 
     def _terminate_posix_group(
@@ -263,35 +554,16 @@ class CommandRunner:
                 errors.append("Process group did not exit before cleanup deadline.")
         return process.poll() is not None and not errors, "; ".join(errors) or None
 
-    def _terminate_windows_tree(
+    def _kill_root_and_wait(
         self,
         process: subprocess.Popen[bytes],
-    ) -> tuple[bool, str | None]:
+    ) -> str | None:
         try:
-            completed = subprocess.run(
-                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.cleanup_grace_seconds,
-                shell=False,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
             process.kill()
-            return False, f"Windows process-tree termination failed: {exc}"
-        try:
             process.wait(timeout=self.cleanup_grace_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return False, "Windows process tree did not exit before cleanup deadline."
-        if completed.returncode != 0:
-            detail = (completed.stderr or "taskkill returned a failure status").strip()
-            return False, detail[:500]
-        return True, None
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"Root process cleanup failed: {exc}"
+        return None
 
 
 class TestRunner:
