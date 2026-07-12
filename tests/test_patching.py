@@ -148,6 +148,36 @@ def test_post_replace_verification_failure_restores_and_records_file(
     assert not list(workspace.glob("*.opencode-lite.backup"))
 
 
+def test_staging_failure_removes_artifact_created_before_ledger_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    patch = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-VALUE = 1
++VALUE = 2
+"""
+
+    def fail_mode_copy(source: Path, destination: Path) -> None:
+        raise OSError(f"simulated mode-copy failure: {source} -> {destination}")
+
+    monkeypatch.setattr("repopilot_lite.patching.shutil.copymode", fail_mode_copy)
+
+    with pytest.raises(PatchApplyError) as captured:
+        PatchApplier().apply(workspace, patch)
+
+    assert "simulated mode-copy failure" in str(captured.value)
+    assert captured.value.replaced_files == []
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not list(workspace.glob("*.opencode-lite.tmp"))
+    assert not list(workspace.glob("*.opencode-lite.backup"))
+
+
 def _write_exact(path: Path, content: str) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         handle.write(content)

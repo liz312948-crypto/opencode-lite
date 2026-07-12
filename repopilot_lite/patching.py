@@ -155,6 +155,7 @@ class PatchApplier:
         prepared = self._prepare_changes(workspace, file_patches)
 
         staged: list[tuple[PreparedChange, Path, Path]] = []
+        cleanup_artifacts: list[Path] = []
         replaced: list[tuple[PreparedChange, Path]] = []
         restored_files: list[str] = []
         restore_errors: list[str] = []
@@ -167,6 +168,7 @@ class PatchApplier:
                     dir=current.path.parent,
                 )
                 temporary = Path(temporary_name)
+                cleanup_artifacts.append(temporary)
                 with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
                     handle.write(change.new_content)
                     handle.flush()
@@ -179,6 +181,7 @@ class PatchApplier:
                     dir=current.path.parent,
                 )
                 backup = Path(backup_name)
+                cleanup_artifacts.append(backup)
                 with os.fdopen(backup_descriptor, "wb") as backup_handle:
                     backup_handle.write(change.original_content)
                     backup_handle.flush()
@@ -218,9 +221,8 @@ class PatchApplier:
                 restore_errors=restore_errors,
             ) from exc
         finally:
-            for _change, temporary, backup in staged:
-                temporary.unlink(missing_ok=True)
-                backup.unlink(missing_ok=True)
+            for artifact in cleanup_artifacts:
+                artifact.unlink(missing_ok=True)
 
         return [file_patch.path for file_patch in file_patches]
 
