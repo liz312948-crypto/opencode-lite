@@ -171,6 +171,7 @@ class ExecutionReport(BaseModel):
     replaced_files: list[str] = Field(default_factory=list)
     restored_files: list[str] = Field(default_factory=list)
     restore_errors: list[str] = Field(default_factory=list)
+    removed_ignored_artifacts: list[str] = Field(default_factory=list)
     final_status: TaskStatus
     failure_stage: str | None = None
     risk_notes: list[str] = Field(default_factory=list)

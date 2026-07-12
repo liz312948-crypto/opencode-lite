@@ -69,6 +69,7 @@ class _ExecutionIntegrity:
     replaced_files: list[str] = field(default_factory=list)
     restored_files: list[str] = field(default_factory=list)
     restore_errors: list[str] = field(default_factory=list)
+    removed_ignored_artifacts: list[str] = field(default_factory=list)
 
 
 class SafeEditingService:
@@ -406,7 +407,7 @@ class SafeEditingService:
                 "The approved test command has changed and must be approved again.",
             )
 
-        baseline_manifest = self.workspace_manager.manifest(workspace)
+        baseline_manifest = self.workspace_manager.integrity_manifest(workspace)
         source_manifest_before = self.workspace_manager.manifest(source)
         if baseline_manifest != source_manifest_before:
             raise EditingError(
@@ -430,7 +431,7 @@ class SafeEditingService:
         try:
             modified_files = self.patch_applier.apply(workspace, patch.unified_diff)
             integrity.replaced_files = list(modified_files)
-            integrity.expected_manifest = self.workspace_manager.manifest(workspace)
+            integrity.expected_manifest = self.workspace_manager.integrity_manifest(workspace)
             actual_diff = self.patch_applier.actual_diff(source, workspace, modified_files)
             patch_apply_log = StepLog(
                 task_id=task.task_id,
@@ -477,7 +478,17 @@ class SafeEditingService:
                     f"Test command failed with exit code {command_result.exit_code}.",
                     "testing",
                 )
-            integrity.final_manifest = self.workspace_manager.manifest(workspace)
+            integrity.removed_ignored_artifacts = (
+                self.workspace_manager.cleanup_ignored_artifacts(
+                    workspace,
+                    task_id=task.task_id,
+                )
+            )
+            if test_log is not None and integrity.removed_ignored_artifacts:
+                test_log.data["removed_ignored_artifacts"] = list(
+                    integrity.removed_ignored_artifacts
+                )
+            integrity.final_manifest = self.workspace_manager.integrity_manifest(workspace)
             integrity.source_manifest_after = self.workspace_manager.manifest(source)
             if integrity.source_manifest_after != integrity.source_manifest_before:
                 raise _ExecutionFailure(
@@ -607,7 +618,7 @@ class SafeEditingService:
                 task.source_repo_path,
             )
             task.workspace_path = str(restored)
-            restored_manifest = self.workspace_manager.manifest(restored)
+            restored_manifest = self.workspace_manager.integrity_manifest(restored)
             integrity.final_manifest = restored_manifest
             integrity.source_manifest_after = self.workspace_manager.manifest(
                 task.source_repo_path
@@ -736,6 +747,7 @@ class SafeEditingService:
             replaced_files=integrity.replaced_files,
             restored_files=integrity.restored_files,
             restore_errors=integrity.restore_errors,
+            removed_ignored_artifacts=integrity.removed_ignored_artifacts,
             final_status=final_status,
             failure_stage=failure_stage,
             risk_notes=result.risk_notes if result else [],

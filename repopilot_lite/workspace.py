@@ -91,7 +91,7 @@ class WorkspaceManager:
             workspace = self.validate_workspace(destination, task_id=task_id)
             if self.manifest(source) != source_manifest:
                 raise WorkspaceError("Source repository changed while the workspace was copied.")
-            if self.manifest(workspace) != source_manifest:
+            if self.integrity_manifest(workspace) != source_manifest:
                 raise WorkspaceError("Workspace copy does not match the source repository.")
             return workspace
         except Exception:
@@ -170,10 +170,30 @@ class WorkspaceManager:
             ) from exc
 
     def manifest(self, root_path: str | Path) -> WorkspaceManifest:
+        """Return the copy-policy manifest, excluding entries never copied from source."""
         try:
             return build_manifest(root_path, IGNORED_WORKSPACE_DIRS)
         except FileSystemSafetyError as exc:
             raise WorkspaceError(str(exc)) from exc
+
+    def integrity_manifest(self, root_path: str | Path) -> WorkspaceManifest:
+        """Return a no-follow manifest that includes every workspace entry."""
+        try:
+            return build_manifest(root_path)
+        except FileSystemSafetyError as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    def cleanup_ignored_artifacts(
+        self,
+        workspace_path: str | Path,
+        *,
+        task_id: str,
+    ) -> list[str]:
+        """Remove test-generated cache/build entries before final integrity checks."""
+        workspace = self.validate_workspace(workspace_path, task_id=task_id)
+        removed: list[str] = []
+        self._remove_ignored_entries_no_follow(workspace, workspace, removed)
+        return sorted(removed)
 
     @staticmethod
     def manifest_hash(value: WorkspaceManifest) -> str:
@@ -193,7 +213,7 @@ class WorkspaceManager:
     ) -> bool:
         workspace = self.validate_workspace(workspace_path)
         source = self.validate_source(source_repo_path)
-        return self.manifest(workspace) == self.manifest(source)
+        return self.integrity_manifest(workspace) == self.manifest(source)
 
     def _copy_tree(self, source: Path, destination: Path) -> None:
         destination.mkdir(parents=False, exist_ok=False)
@@ -250,6 +270,65 @@ class WorkspaceManager:
         if FileSystemIdentity.from_stat(root.stat()) != expected:
             raise WorkspaceError(f"Workspace identity changed during cleanup: {root}")
         root.rmdir()
+
+    def _remove_ignored_entries_no_follow(
+        self,
+        workspace: Path,
+        directory: Path,
+        removed: list[str],
+    ) -> None:
+        try:
+            expected_directory = FileSystemIdentity.from_stat(directory.stat())
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as exc:
+            raise WorkspaceError(
+                f"Workspace artifacts could not be enumerated: {directory}"
+            ) from exc
+
+        for entry in entries:
+            candidate = Path(entry.path)
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceError(
+                    f"Workspace artifact could not be inspected: {candidate}"
+                ) from exc
+            relative = candidate.relative_to(workspace).as_posix()
+            if entry.name in IGNORED_WORKSPACE_DIRS:
+                if is_link_or_reparse(candidate, metadata):
+                    _remove_link_object(candidate, metadata)
+                elif entry.is_dir(follow_symlinks=False):
+                    self._remove_tree_no_follow(candidate)
+                elif entry.is_file(follow_symlinks=False):
+                    expected_file = FileSystemIdentity.from_stat(metadata)
+                    if FileSystemIdentity.from_stat(candidate.lstat()) != expected_file:
+                        raise WorkspaceError(
+                            f"Workspace artifact identity changed before cleanup: {relative}"
+                        )
+                    candidate.unlink()
+                else:
+                    raise WorkspaceError(
+                        f"Special workspace artifact cannot be cleaned: {relative}"
+                    )
+                removed.append(relative)
+                continue
+
+            if is_link_or_reparse(candidate, metadata):
+                raise WorkspaceError(
+                    f"Unexpected link or reparse point remained after tests: {relative}"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                self._remove_ignored_entries_no_follow(workspace, candidate, removed)
+            elif not entry.is_file(follow_symlinks=False):
+                raise WorkspaceError(
+                    f"Special filesystem entry remained after tests: {relative}"
+                )
+
+        if FileSystemIdentity.from_stat(directory.stat()) != expected_directory:
+            raise WorkspaceError(
+                f"Workspace directory identity changed during artifact cleanup: {directory}"
+            )
 
     def _assert_base_unchanged(self) -> None:
         if not os.path.lexists(self.base_dir) or is_link_or_reparse(self.base_dir):

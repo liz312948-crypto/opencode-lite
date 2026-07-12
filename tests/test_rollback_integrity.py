@@ -129,6 +129,34 @@ def test_mutate_and_pass():
     assert manager.manifest(repo) == source_before
 
 
+def test_passing_tests_discard_ignored_artifacts_before_success(tmp_path: Path) -> None:
+    test_source = """from pathlib import Path
+
+def test_generate_ignored_artifacts():
+    Path('build').mkdir(exist_ok=True)
+    Path('build/artifact.txt').write_text('generated\\n', encoding='utf-8')
+    Path('.pytest_cache').mkdir(exist_ok=True)
+    Path('.pytest_cache/state').write_text('cache\\n', encoding='utf-8')
+    assert True
+"""
+    service, _, task, repo, manager = _approved_context(tmp_path, test_source)
+
+    result = service.execute_patch(task)
+
+    report = result.execution_report
+    assert result.status == TaskStatus.SUCCEEDED
+    assert report is not None
+    assert report.tests_passed is True
+    assert "build" in report.removed_ignored_artifacts
+    assert ".pytest_cache" in report.removed_ignored_artifacts
+    assert report.expected_manifest_hash == report.final_manifest_hash
+    workspace = Path(result.workspace_path or "")
+    assert not (workspace / "build").exists()
+    assert not (workspace / ".pytest_cache").exists()
+    assert (workspace / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (repo / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
 def test_rollback_failure_is_never_reported_as_success(tmp_path: Path) -> None:
     test_source = """def test_failure():
     assert False
