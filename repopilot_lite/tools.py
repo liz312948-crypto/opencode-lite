@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from repopilot_lite.filesystem_safety import (
+    FileSystemSafetyError,
+    WalkEntry,
+    read_verified_bytes,
+    validate_directory,
+    validate_regular_file,
+    walk_tree_no_follow,
+)
 from repopilot_lite.llm_client import OptionalLLMSummarizer
-
 
 IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build"}
 TEXT_SUFFIXES = {
@@ -55,15 +62,23 @@ class ToolRegistry:
         return tool.handler(**kwargs)
 
     def list_tools(self) -> list[dict[str, str]]:
-        return [{"name": tool.name, "description": tool.description} for tool in self._tools.values()]
+        return [
+            {"name": tool.name, "description": tool.description} for tool in self._tools.values()
+        ]
 
 
 def create_default_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register("list_files", "List readable files in a repository.", list_files)
-    registry.register("read_file", "Read a text file from a repository by relative path.", read_file)
+    registry.register(
+        "read_file", "Read a text file from a repository by relative path.", read_file
+    )
     registry.register("search_text", "Search text keywords inside repository files.", search_text)
-    registry.register("summarize_repo", "Generate repository understanding and modification planning output.", summarize_repo)
+    registry.register(
+        "summarize_repo",
+        "Generate repository understanding and modification planning output.",
+        summarize_repo,
+    )
     return registry
 
 
@@ -71,28 +86,28 @@ def list_files(repo_path: str, max_files: int = 200) -> dict[str, Any]:
     repo = _resolve_repo(repo_path)
     files: list[str] = []
 
-    for path in repo.rglob("*"):
+    for entry in _safe_repo_entries(repo):
         if len(files) >= max_files:
             break
-        if _should_skip(path, repo) or not path.is_file():
+        if entry.file_type != "file":
             continue
-        files.append(path.relative_to(repo).as_posix())
+        files.append(entry.relative_path)
 
     return {"files": files, "count": len(files), "truncated": len(files) >= max_files}
 
 
 def read_file(repo_path: str, file_path: str, max_chars: int = 12000) -> dict[str, Any]:
     repo = _resolve_repo(repo_path)
-    target = _resolve_inside_repo(repo, file_path)
-
-    if not target.exists() or not target.is_file():
-        raise FileNotFoundError(f"File does not exist: {file_path}")
-
-    text = _read_text_safely(target, max_chars=max_chars)
+    try:
+        token = validate_regular_file(repo, file_path)
+        content = read_verified_bytes(token)
+    except FileSystemSafetyError as exc:
+        raise ValueError(str(exc)) from exc
+    text = content.decode("utf-8", errors="ignore")
     return {
-        "file_path": target.relative_to(repo).as_posix(),
-        "content": text,
-        "truncated": target.stat().st_size > max_chars,
+        "file_path": token.relative_path,
+        "content": text[:max_chars],
+        "truncated": len(text) > max_chars,
     }
 
 
@@ -104,15 +119,16 @@ def search_text(repo_path: str, keywords: list[str], max_matches: int = 50) -> d
     if not normalized_keywords:
         return {"matches": matches, "count": 0, "keywords": []}
 
-    for path in repo.rglob("*"):
+    for entry in _safe_repo_entries(repo):
         if len(matches) >= max_matches:
             break
-        if _should_skip(path, repo) or not path.is_file() or not _looks_text_file(path):
+        if entry.file_type != "file" or not _looks_text_file(entry.path):
             continue
 
         try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
+            token = validate_regular_file(repo, entry.relative_path)
+            lines = read_verified_bytes(token).decode("utf-8", errors="ignore").splitlines()
+        except (FileSystemSafetyError, OSError):
             continue
 
         for line_number, line in enumerate(lines, start=1):
@@ -122,7 +138,7 @@ def search_text(repo_path: str, keywords: list[str], max_matches: int = 50) -> d
                 continue
             matches.append(
                 {
-                    "file_path": path.relative_to(repo).as_posix(),
+                    "file_path": entry.relative_path,
                     "line_number": line_number,
                     "line": line.strip()[:300],
                     "keywords": hit_keywords,
@@ -155,9 +171,12 @@ def summarize_repo(
     if llm_result is not None:
         return _normalize_summary_result(llm_result, key_files)
 
-    readme_summary = _compact_text(readme, max_chars=600) if readme else "No README content was found."
+    readme_summary = (
+        _compact_text(readme, max_chars=600) if readme else "No README content was found."
+    )
     summary = (
-        f"Repository '{repo.name}' contains {len(files)} indexed files and is ready for modification planning. "
+        f"Repository '{repo.name}' contains {len(files)} indexed files "
+        "and is ready for modification planning. "
         f"The question is: {question}. "
         f"README signal: {readme_summary}"
     )
@@ -169,13 +188,16 @@ def summarize_repo(
         "Add or update tests before changing behavior in shared modules.",
     ]
     suggestions = [
-        "Start with README and project configuration files to confirm setup and runtime assumptions.",
+        "Start with README and project configuration files to confirm setup "
+        "and runtime assumptions.",
         "Inspect the listed key files before changing behavior.",
         "Add focused tests around the requested behavior before making code changes.",
     ]
 
     if search_matches:
-        suggestions.insert(1, "Review keyword matches because they are the most direct links to the question.")
+        suggestions.insert(
+            1, "Review keyword matches because they are the most direct links to the question."
+        )
 
     return {
         "repo_summary": summary,
@@ -188,22 +210,26 @@ def summarize_repo(
 
 
 def _resolve_repo(repo_path: str) -> Path:
-    repo = Path(repo_path).expanduser().resolve()
-    if not repo.exists() or not repo.is_dir():
-        raise FileNotFoundError(f"Repository path does not exist or is not a directory: {repo_path}")
-    return repo
+    try:
+        return validate_directory(repo_path)
+    except FileSystemSafetyError as exc:
+        raise FileNotFoundError(
+            f"Repository path does not exist or is not a directory: {repo_path}"
+        ) from exc
 
 
 def _resolve_inside_repo(repo: Path, file_path: str) -> Path:
-    target = (repo / file_path).resolve()
-    if repo not in target.parents and target != repo:
-        raise ValueError(f"File path is outside repository: {file_path}")
-    return target
+    try:
+        return validate_regular_file(repo, file_path).path
+    except FileSystemSafetyError as exc:
+        raise ValueError(str(exc)) from exc
 
 
-def _should_skip(path: Path, repo: Path) -> bool:
-    relative_parts = path.relative_to(repo).parts
-    return any(part in IGNORED_DIRS for part in relative_parts)
+def _safe_repo_entries(repo: Path) -> Iterator[WalkEntry]:
+    try:
+        yield from walk_tree_no_follow(repo, frozenset(IGNORED_DIRS))
+    except FileSystemSafetyError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _looks_text_file(path: Path) -> bool:
@@ -213,7 +239,8 @@ def _looks_text_file(path: Path) -> bool:
 
 
 def _read_text_safely(path: Path, max_chars: int) -> str:
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    token = validate_regular_file(path.parent, path.name)
+    text = read_verified_bytes(token).decode("utf-8", errors="ignore")
     return text[:max_chars]
 
 
@@ -227,9 +254,11 @@ def _select_key_files(files: list[str], search_matches: list[dict[str, Any]]) ->
     priority_names = ("README", "pyproject.toml", "requirements.txt", "main.py", "app.py")
     for file_path in files:
         name = Path(file_path).name
-        if any(name.startswith(priority) or name == priority for priority in priority_names):
-            if file_path not in weighted:
-                weighted.append(file_path)
+        if (
+            any(name.startswith(priority) or name == priority for priority in priority_names)
+            and file_path not in weighted
+        ):
+            weighted.append(file_path)
 
     for file_path in files[:10]:
         if file_path not in weighted:
@@ -249,13 +278,18 @@ def _build_modification_plan(question: str, key_files: list[str]) -> list[dict[s
             "title": "Confirm existing behavior",
             "target_files": primary_files,
             "action": "Read the key files and map the current request flow before editing.",
-            "reason": f"The question '{question}' should be grounded in the current implementation first.",
+            "reason": (
+                f"The question '{question}' should be grounded in the current implementation first."
+            ),
         },
         {
             "title": "Design the smallest code change",
             "target_files": primary_files,
             "action": "Identify the minimal functions or modules that need updates.",
-            "reason": "Keeping the change narrow lowers regression risk and preserves the existing architecture.",
+            "reason": (
+                "Keeping the change narrow lowers regression risk and preserves "
+                "the existing architecture."
+            ),
         },
         {
             "title": "Add verification coverage",
@@ -266,11 +300,15 @@ def _build_modification_plan(question: str, key_files: list[str]) -> list[dict[s
     ]
 
 
-def _normalize_summary_result(result: dict[str, Any], fallback_key_files: list[str]) -> dict[str, Any]:
+def _normalize_summary_result(
+    result: dict[str, Any], fallback_key_files: list[str]
+) -> dict[str, Any]:
     return {
         "repo_summary": str(result.get("repo_summary") or "LLM summary was unavailable."),
         "key_files": _string_list(result.get("key_files")) or fallback_key_files,
-        "modification_plan": _modification_plan_list(result.get("modification_plan"), fallback_key_files),
+        "modification_plan": _modification_plan_list(
+            result.get("modification_plan"), fallback_key_files
+        ),
         "risk_notes": _string_list(result.get("risk_notes"))
         or ["LLM output should be reviewed before applying any code changes."],
         "llm_used": bool(result.get("llm_used")),
@@ -292,7 +330,9 @@ def _modification_plan_list(value: Any, fallback_key_files: list[str]) -> list[d
                 "title": str(item.get("title") or "Review planned change"),
                 "target_files": _string_list(item.get("target_files")) or fallback_key_files[:3],
                 "action": str(item.get("action") or "Inspect the target files."),
-                "reason": str(item.get("reason") or "The step supports safer modification planning."),
+                "reason": str(
+                    item.get("reason") or "The step supports safer modification planning."
+                ),
             }
         )
 

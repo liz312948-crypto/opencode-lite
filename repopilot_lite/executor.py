@@ -22,7 +22,7 @@ class Executor:
             "search_matches": [],
             "summary_result": None,
         }
-        self.storage.update_status(task, TaskStatus.RUNNING)
+        self.storage.transition_status(task, TaskStatus.RUNNING)
 
         try:
             for step in task.plan:
@@ -41,10 +41,21 @@ class Executor:
                     search_matches=context["search_matches"],
                 )
             task.result = TaskResult.model_validate(result)
-            self.storage.update_status(task, TaskStatus.SUCCESS)
+            self.storage.transition_status(task, TaskStatus.SUCCESS)
         except Exception as exc:
-            self._log(task, "executor", "FAILED", str(exc))
-            self.storage.update_status(task, TaskStatus.FAILED, error=str(exc))
+            failure_log = StepLog(
+                task_id=task.task_id,
+                step="executor",
+                status="FAILED",
+                message=str(exc),
+            )
+            self.storage.transition_status(
+                task,
+                TaskStatus.FAILED,
+                error_code="EXECUTOR_FAILED",
+                error_message=str(exc),
+                additional_logs=(failure_log,),
+            )
 
         return self.storage.get_task(task.task_id) or task
 
@@ -64,7 +75,9 @@ class Executor:
             readme_path = self._find_readme(context["files"])
             if readme_path is None:
                 return {"file_path": None, "content": None, "message": "README not found."}
-            output = self.registry.call("read_file", repo_path=task.repo_path, file_path=readme_path)
+            output = self.registry.call(
+                "read_file", repo_path=task.repo_path, file_path=readme_path
+            )
             context["readme"] = output["content"]
             return output
 
@@ -106,7 +119,9 @@ class Executor:
                 {"retry": retry_number, "keywords": keywords},
             )
             output = self.registry.call("search_text", repo_path=task.repo_path, keywords=keywords)
-            attempts.append({"keywords": output.get("keywords", keywords), "count": output.get("count", 0)})
+            attempts.append(
+                {"keywords": output.get("keywords", keywords), "count": output.get("count", 0)}
+            )
 
         output["attempts"] = attempts
         output["retries"] = len(attempts) - 1
@@ -139,7 +154,9 @@ class Executor:
         return None
 
     @staticmethod
-    def _broaden_keywords(question: str, previous_keywords: list[str], retry_number: int) -> list[str]:
+    def _broaden_keywords(
+        question: str, previous_keywords: list[str], retry_number: int
+    ) -> list[str]:
         broad_terms = ["api", "task", "repo", "file", "test", "readme"]
         if retry_number == 2:
             broad_terms.extend(["main", "config", "storage", "tool", "executor", "planner"])

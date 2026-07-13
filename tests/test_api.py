@@ -13,7 +13,9 @@ def test_task_lifecycle(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "sample_repo"
     repo.mkdir()
     (repo / "README.md").write_text("# Sample\n\nFastAPI service demo.", encoding="utf-8")
-    (repo / "main.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8")
+    (repo / "main.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8"
+    )
 
     storage = Storage(tmp_path / "data")
     app.dependency_overrides[get_storage] = lambda: storage

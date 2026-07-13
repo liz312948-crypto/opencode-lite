@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+testpaths = ["fixture_tests"]
+python_files = ["check_*.py"]
