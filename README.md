@@ -1,7 +1,9 @@
 # OpenCode-Lite
 
-OpenCode-Lite is a safe, inspectable, and test-driven coding agent harness for
-repository-level tasks.
+[![CI](https://github.com/liz312948-crypto/opencode-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/liz312948-crypto/opencode-lite/actions/workflows/ci.yml)
+
+OpenCode-Lite is a safe, inspectable, test-driven coding-agent harness that turns a
+reviewed unified diff into a verified workspace-only edit or a verified rollback.
 
 It accepts a local repository and a question, builds repository context and a
 modification plan, then supports a human-reviewed patch workflow inside an isolated
@@ -14,7 +16,8 @@ inspectable through the API.
 > **独立项目免责声明：** OpenCode-Lite 是一个独立的学习与工程项目，不隶属于
 > OpenCode 项目，也未获得其认可或背书。
 
-Current version: **v0.3.0-alpha** (`0.3.0a1` in Python package metadata).
+Current version: [**v0.3.0-alpha**](https://github.com/liz312948-crypto/opencode-lite/releases/tag/v0.3.0-alpha)
+(`0.3.0a1` in Python package metadata).
 
 ## Why This Project
 
@@ -78,29 +81,84 @@ OpenCode-Lite currently does **not** provide:
 Successful edits remain only in the task workspace. There is intentionally no
 `apply-to-source` endpoint in v0.3.0-alpha.
 
+## 5-Minute Quick Start
+
+The demos use only `tests/fixtures/sample_repo`; they do not edit a real user
+repository. Keep the API bound to loopback and use one Uvicorn worker.
+
+### Windows
+
+```powershell
+git clone https://github.com/liz312948-crypto/opencode-lite.git
+Set-Location opencode-lite
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+python -m uvicorn repopilot_lite.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+In a second PowerShell window at the repository root:
+
+```powershell
+.\scripts\demo_success.ps1
+.\scripts\demo_rollback.ps1
+```
+
+If local policy blocks either script, change policy only for that process:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+### Linux
+
+```bash
+git clone https://github.com/liz312948-crypto/opencode-lite.git
+cd opencode-lite
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+unset OPENAI_API_KEY
+python -m uvicorn repopilot_lite.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+The reproducible demos are PowerShell scripts. With PowerShell 7 installed, run them
+from a second terminal:
+
+```bash
+pwsh ./scripts/demo_success.ps1
+pwsh ./scripts/demo_rollback.ps1
+```
+
+Both scripts fail closed on non-loopback URLs, verify the API contract, bind approval
+to the returned Patch SHA-256, print the final task/report/logs, and byte-check the
+fixture source before and after execution.
+
 ## Architecture
 
 ```mermaid
 flowchart LR
     U["API client"] --> A["FastAPI routes"]
-    A --> P["Planner"]
-    P --> E["Executor"]
-    E --> T["ToolRegistry"]
-    T --> C["Repository context"]
+    subgraph Analysis["Bounded repository analysis"]
+        P["Planner"] --> E["Executor"] --> T["ToolRegistry"] --> C["Repository context"]
+    end
+    subgraph Editing["Safe editing harness"]
+        SRC["Source repository<br/>read/copy only"] --> W["Isolated workspace"]
+        W --> PP["Validated PatchProposal"]
+        PP --> G["Approval gate<br/>ID + SHA-256 + command + revision"]
+        G --> PA["PatchApplier"] --> TR["TestRunner / CommandRunner"]
+        TR --> V["Final manifest verification"]
+        V --> OK["SUCCEEDED<br/>workspace retained"]
+        V --> RB["ROLLING_BACK -> FAILED<br/>baseline verified"]
+    end
+    A --> P
+    A --> W
     C --> S["Rule or optional LLM summary"]
-    A --> W["WorkspaceManager"]
-    W --> PP["PatchProposal"]
-    PP --> G["Approval gate"]
-    G --> PA["PatchApplier"]
-    PA --> TR["TestRunner"]
-    TR --> CR["CommandRunner"]
-    CR --> R["ExecutionReport"]
-    R --> OK["SUCCEEDED"]
-    R --> RB["ROLLING_BACK -> FAILED"]
-    A --> J["JSON Storage + StepLog"]
+    A --> J["Revisioned JSON Storage<br/>redo journal + StepLog"]
     E --> J
-    W --> J
-    R --> J
+    G --> J
+    V --> J
 ```
 
 The internal Python package remains `repopilot_lite` in v0.3 so existing imports and
@@ -185,10 +243,19 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
+## Install On Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev]'
+```
+
 ## Run
 
 ```powershell
-uvicorn repopilot_lite.main:app --host 127.0.0.1 --workers 1
+python -m uvicorn repopilot_lite.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). The OpenAPI page exposes
@@ -216,7 +283,33 @@ optional `test_command` and `test_timeout_seconds` fields.
 
 See [API Examples](docs/api-examples.md) for request and error shapes.
 
-## End-To-End Demo
+## Success Demo
+
+With the API running, execute:
+
+```powershell
+.\scripts\demo_success.ps1
+```
+
+The script repairs `calculator.py` only in the task workspace, receives
+`SUCCEEDED`, verifies `tests_passed`, checks the expected/final manifests, prints the
+Task, `ExecutionReport`, and logs, then proves the fixture source tree is byte-for-byte
+unchanged.
+
+## Rollback Demo
+
+```powershell
+.\scripts\demo_rollback.ps1
+```
+
+This patch is valid and applies cleanly, but intentionally makes the fixture test
+fail. The script requires `FAILED`, `rollback_succeeded: true`, a restored baseline
+manifest, a restored workspace tree, and an unchanged fixture source tree.
+
+Both scripts accept `-BaseUrl` for another loopback port. They intentionally reject
+remote hosts and repositories other than the fixed fixture.
+
+## Manual API Walkthrough
 
 Start the API in one PowerShell window, then run the following in another from the
 repository root. This demo safely fixes the bug in the copied fixture repository.
@@ -344,6 +437,8 @@ Task workspaces live under the operating system temporary directory by default.
 python -m pytest -q -p no:cacheprovider
 python -m ruff check .
 python -m mypy --python-version 3.12 repopilot_lite
+python -m compileall repopilot_lite
+git diff --check
 ```
 
 If Windows denies the default pytest temporary directory:
@@ -358,11 +453,14 @@ state transitions, symlink/reparse rejection, traversal rejection, dry-run failu
 stale approval, concurrent execute serialization, successful execution, process-tree
 timeout cleanup, rollback content/manifest verification, JSON fault recovery, bounded
 output, and Windows-style path rejection.
+The GitHub Actions CI badge at the top of this page covers Python 3.12 on both Windows
+and Ubuntu.
 
 ## Project Structure
 
 ```text
 OpenCode-Lite/
++-- AGENTS.md                 # Project-specific agent and contribution rules
 +-- repopilot_lite/
 |   +-- main.py             # FastAPI routes and dependencies
 |   +-- models.py           # Task, patch, command, and report schemas
@@ -371,11 +469,16 @@ OpenCode-Lite/
 |   +-- tools.py            # ToolRegistry and repository tools
 |   +-- llm_client.py       # Optional OpenAI-compatible summarizer
 |   +-- state_machine.py    # Legal task status transitions
+|   +-- filesystem_safety.py # No-follow path, identity, and manifest checks
 |   +-- workspace.py        # Isolated copy/reset/cleanup lifecycle
 |   +-- patching.py         # Unified diff validation and application
 |   +-- runners.py          # CommandRunner and TestRunner
 |   +-- editing_service.py  # Approval, execution, rollback orchestration
+|   +-- task_locks.py       # Per-task in-process workflow serialization
 |   +-- storage.py          # JSON task, log, and patch persistence
++-- scripts/
+|   +-- demo_success.ps1    # Reproducible approved-success workflow
+|   +-- demo_rollback.ps1   # Reproducible failing-test rollback workflow
 +-- tests/
 |   +-- fixtures/sample_repo/
 |   +-- test_*.py
@@ -383,6 +486,7 @@ OpenCode-Lite/
 |   +-- architecture.md
 |   +-- safe-editing.md
 |   +-- api-examples.md
+|   +-- interview-notes.md
 |   +-- v0.3.0-alpha-plan.md
 +-- CHANGELOG.md
 +-- pyproject.toml
@@ -413,6 +517,20 @@ OpenCode-Lite/
   bounded stdout/stderr, README excerpts, search matches, and local paths.
 - The patch parser intentionally supports a conservative subset of unified diff.
 - Internal imports still use `repopilot_lite` for compatibility during the rename.
+
+## Interview And Learning Value
+
+OpenCode-Lite is intentionally small enough to trace end to end while still exposing
+real engineering tradeoffs: state ownership, stale approvals, path identity,
+cross-platform process cleanup, idempotent execution, manifest-based recovery, and
+crash-consistent persistence. The [interview notes](docs/interview-notes.md) provide 20
+short answers, deep dives, and likely follow-up questions, including a two-minute
+project introduction and an explicit discussion of limitations.
+
+For historical context, `docs/v0.3-reliability-review.md` is the pre-hardening audit;
+the released implementation incorporates its release-blocking fixes. Current behavior
+is described by this README, [Architecture](docs/architecture.md), and
+[Safe Editing](docs/safe-editing.md).
 
 ## v0.4 Roadmap
 
